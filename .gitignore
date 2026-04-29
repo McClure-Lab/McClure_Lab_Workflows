@@ -6,3 +6,7 @@ results
 
 # Ignore the /data directory
 data
+
+
+# Ignore all the virtual environments for the workflows
+*_env/

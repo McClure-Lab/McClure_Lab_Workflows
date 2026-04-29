@@ -45,6 +45,12 @@ def parse_args():
         default="Unknown",
         help="Phase label for the plot title (e.g., Mitosis or S Phase)"
     )
+    parser.add_argument(
+        "--output_manifest",
+        required=False,
+        default=None,
+        help="Optional file to write the generated rain plot PNG paths to"
+    )
     return parser.parse_args()
 
 
@@ -166,7 +172,8 @@ def plot_rainplots_per_read(
     region_start=None,
     region_end=None,
     rfb_dir=None,
-    phase="Unknown"
+    phase="Unknown",
+    output_manifest=None
 ):
     df = load_rain_plot_input(input_file)
     outdir = get_output_dir(output_dir)
@@ -199,6 +206,8 @@ def plot_rainplots_per_read(
     sample_size = min(max_reads, len(all_read_ids))
     sampled_reads = np.random.choice(all_read_ids, size=sample_size, replace=False)
     df = df[df["read_id"].isin(sampled_reads)]
+
+    generated_paths = []
 
     for i, (rid, sub) in enumerate(df.groupby("read_id", sort=False), start=1):
         if i > max_reads:
@@ -306,6 +315,12 @@ def plot_rainplots_per_read(
         fig.tight_layout()
         fig.savefig(outpath, dpi=200)
         plt.close(fig)
+        generated_paths.append(outpath)
+
+    if output_manifest:
+        with open(output_manifest, "w", encoding="utf-8") as handle:
+            for path in generated_paths:
+                handle.write(f"{path}\n")
 
 
 if __name__ == "__main__":
@@ -316,5 +331,6 @@ if __name__ == "__main__":
         args.region_start,
         args.region_end,
         args.rfb_dir,
-        args.phase
+        args.phase,
+        args.output_manifest
     )

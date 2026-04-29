@@ -39,6 +39,7 @@ SRC_DIR="$WORKFLOW_ROOT/src/rainplot_workflow"
 UTILS_DIR="$WORKFLOW_ROOT/src/utils"
 TOOLS_DIR="$WORKFLOW_ROOT/tools"
 RESULTS_DIR="$WORKFLOW_ROOT/results/rainplot_results"
+GFF_FILE="$NCBI_DIR/sacCer3/genomic.gff"
 
 LIFTOVER_BIN="$TOOLS_DIR/liftOver"
 LIFTOVER_URL="https://hgdownload.soe.ucsc.edu/admin/exe/linux.x86_64/liftOver"
@@ -87,9 +88,12 @@ RFB_OUTPUT="$BED_DIR/rfb_bases${START}_to_${END}.bed"
 OUTPUT_BASENAME="$(basename "$OUTPUT_NAME" .bed)"
 LIFTOVER_OUTPUT="$BED_DIR/liftover_${OUTPUT_BASENAME}.bed"
 LIFTOVER_UNMAPPED_OUTPUT="$BED_DIR/liftover_${OUTPUT_BASENAME}_unmapped.bed"
+RAINPLOT_MANIFEST="$RESULTS_DIR/${OUTPUT_BASENAME}_rainplots_manifest.txt"
+GENOMIC_FEATURE_PNG="$RESULTS_DIR/genomic_feature_${OUTPUT_BASENAME}.png"
 
 BED_TO_USE="$OUTPUT"
 USE_RFB_OVERLAY="yes"
+GENERATE_GENOMIC_FEATURES="yes"
 
 if [ ! -f "$BAM" ]; then
   echo "[ERROR] BAM file not found: $BAM"
@@ -110,6 +114,7 @@ echo "[INFO] Phase label detected: $PHASE_LABEL"
 
 # --- Virtual environment setup ---
 VENV_DIR="$SRC_DIR/.rainplot_env"
+RENV_DIR="$SRC_DIR/.renv"
 
 if [ ! -d "$VENV_DIR" ]; then
   echo "[INFO] Virtual environment not found. Creating $VENV_DIR..."
@@ -136,6 +141,27 @@ if [ $? -ne 0 ]; then
   exit 1
 fi
 echo "[INFO] Libraries installed successfully."
+
+# --- Local R library setup ---
+if [ ! -d "$RENV_DIR" ]; then
+  echo "[INFO] renv project directory not found. Creating $RENV_DIR..."
+  mkdir -p "$RENV_DIR"
+  if [ $? -ne 0 ]; then
+    echo "[ERROR] Failed to create renv project directory. Exiting."
+    deactivate
+    exit 1
+  fi
+  echo "[INFO] renv project directory created."
+fi
+
+echo "[INFO] Ensuring renv is initialized and restored for $SRC_DIR..."
+Rscript "$SRC_DIR/ensure_r_environment.R" "$SRC_DIR"
+if [ $? -ne 0 ]; then
+  echo "[ERROR] renv setup failed. Exiting."
+  deactivate
+  exit 1
+fi
+echo "[INFO] renv environment ready."
 
 # --- BrdU extraction ---
 CMD="python $SRC_DIR/raw_data_extraction_on_bam.py $BAM -c $CHROM -s $START -e $END -o $OUTPUT"
@@ -223,11 +249,13 @@ while true; do
 
       BED_TO_USE="$LIFTOVER_OUTPUT"
       USE_RFB_OVERLAY="no"
+      GENERATE_GENOMIC_FEATURES="no"
 
       echo "[INFO] LiftOver complete: $LIFTOVER_OUTPUT"
       echo "[INFO] Unmapped LiftOver intervals written to: $LIFTOVER_UNMAPPED_OUTPUT"
       echo "[INFO] The workflow will use the lifted BED file for plotting."
       echo "[INFO] RFB overlay will be skipped because the RFB BED file was not lifted and would be in a different coordinate system."
+      echo "[INFO] Genomic feature annotation will also be skipped because the local GFF coordinates do not match the lifted coordinate system."
       break
       ;;
     [Nn] )
@@ -264,13 +292,15 @@ if [ "$USE_RFB_OVERLAY" = "yes" ]; then
     --region_start "$START" \
     --region_end "$END" \
     --rfb_dir "$BED_DIR" \
-    --phase "$PHASE_LABEL"
+    --phase "$PHASE_LABEL" \
+    --output_manifest "$RAINPLOT_MANIFEST"
 else
   python "$SRC_DIR/rainplot_generation.py" "$BED_TO_USE" \
     -o "$RESULTS_DIR" \
     --region_start "$START" \
     --region_end "$END" \
-    --phase "$PHASE_LABEL"
+    --phase "$PHASE_LABEL" \
+    --output_manifest "$RAINPLOT_MANIFEST"
 fi
 
 if [ $? -ne 0 ]; then
@@ -280,6 +310,55 @@ if [ $? -ne 0 ]; then
 fi
 
 echo "[INFO] Rain plots complete. Saved to: $RESULTS_DIR"
+
+if [ ! -s "$RAINPLOT_MANIFEST" ]; then
+  echo "[ERROR] Rain plot manifest is empty or was not created: $RAINPLOT_MANIFEST"
+  deactivate
+  exit 1
+fi
+
+if [ "$GENERATE_GENOMIC_FEATURES" = "yes" ]; then
+  if [ ! -f "$GFF_FILE" ]; then
+    echo "[ERROR] Genomic annotation file not found: $GFF_FILE"
+    deactivate
+    exit 1
+  fi
+
+  echo "[INFO] Generating genomic feature plot with Gviz..."
+  Rscript "$SRC_DIR/genomic_feature_plot.R" \
+    "$GFF_FILE" \
+    "$CHROM" \
+    "$START" \
+    "$END" \
+    "$GENOMIC_FEATURE_PNG"
+
+  if [ $? -ne 0 ] || [ ! -s "$GENOMIC_FEATURE_PNG" ]; then
+    echo "[ERROR] Genomic feature plot generation failed."
+    deactivate
+    exit 1
+  fi
+
+  echo "[INFO] Genomic feature plot complete: $GENOMIC_FEATURE_PNG"
+
+  echo "[INFO] Combining rain plots with genomic feature plot..."
+  python "$SRC_DIR/combine_rainplot_images.py" \
+    --manifest "$RAINPLOT_MANIFEST" \
+    --annotation_png "$GENOMIC_FEATURE_PNG" \
+    --output_dir "$RESULTS_DIR" \
+    --delete_inputs
+
+  if [ $? -ne 0 ]; then
+    echo "[ERROR] Combined plot generation failed."
+    deactivate
+    exit 1
+  fi
+
+  echo "[INFO] Combined rain plots saved to: $RESULTS_DIR"
+else
+  echo "[INFO] Combined genomic feature plots were skipped for this run."
+fi
+
+rm -f "$RAINPLOT_MANIFEST"
 
 deactivate
 echo "[INFO] Virtual environment deactivated."
