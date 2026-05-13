@@ -7,6 +7,9 @@ if (length(script_arg) == 1) {
   script_dir <- getwd()
 }
 
+workflow_root <- dirname(dirname(script_dir))
+g4_bed_file <- file.path(workflow_root, "data", "bed", "g4.motifs.bed")
+
 local_r_library <- Sys.getenv("R_LIBS_USER", unset = "")
 if (!nzchar(local_r_library)) {
   local_r_library <- file.path(script_dir, ".r_library")
@@ -369,7 +372,8 @@ feature_rank <- c(
   "snRNA" = 8,
   "ncRNA" = 9,
   "repeat_region" = 10,
-  "mobile_genetic_element" = 11
+  "mobile_genetic_element" = 11,
+  "g4_motif" = 12
 )
 
 feature_color <- function(feature_type) {
@@ -386,6 +390,7 @@ feature_color <- function(feature_type) {
     "ncRNA" = "#5E35B1",
     "repeat_region" = "#F39C12",
     "mobile_genetic_element" = "#D35400",
+    "g4_motif" = "#008080",
     "#4A4A4A"
   )
 }
@@ -404,6 +409,7 @@ feature_type_label <- function(feature_type) {
     "ncRNA" = "ncRNAs",
     "repeat_region" = "Repeat regions",
     "mobile_genetic_element" = "Mobile genetic elements",
+    "g4_motif" = "G4 motifs",
     feature_type
   )
 }
@@ -499,13 +505,105 @@ draw_feature_ruler <- function(feature_row, y, region_start, region_end, region_
   )
 }
 
+read_g4_from_bed <- function(path, requested_chrom, region_start, region_end) {
+  if (!file.exists(path)) {
+    return(data.frame())
+  }
+
+  g4_df <- tryCatch(
+    read.delim(path, header = FALSE, stringsAsFactors = FALSE),
+    error = function(e) data.frame()
+  )
+
+  if (nrow(g4_df) == 0) {
+    return(data.frame())
+  }
+
+  if (ncol(g4_df) < 3) {
+    return(data.frame())
+  }
+
+  colnames(g4_df)[1:3] <- c("chrom", "start", "end")
+  if (ncol(g4_df) >= 4) {
+    colnames(g4_df)[4] <- "name"
+  } else {
+    g4_df$name <- paste0("G4_", seq_len(nrow(g4_df)))
+  }
+
+  g4_df$start <- suppressWarnings(as.integer(g4_df$start))
+  g4_df$end <- suppressWarnings(as.integer(g4_df$end))
+  g4_df <- g4_df[!is.na(g4_df$start) & !is.na(g4_df$end), , drop = FALSE]
+  if (nrow(g4_df) == 0) {
+    return(data.frame())
+  }
+
+  keep <- vapply(g4_df$chrom, resolve_chromosome, character(1)) == requested_chrom
+  g4_df <- g4_df[keep, , drop = FALSE]
+  if (nrow(g4_df) == 0) {
+    return(data.frame())
+  }
+
+  g4_df <- g4_df[g4_df$end > region_start & g4_df$start < region_end, , drop = FALSE]
+  if (nrow(g4_df) == 0) {
+    return(data.frame())
+  }
+
+  data.frame(
+    chrom = requested_chrom,
+    start = pmax(region_start, g4_df$start),
+    end = pmin(region_end, g4_df$end),
+    name = g4_df$name,
+    feature_type = "g4_motif",
+    stringsAsFactors = FALSE
+  )
+}
+
+draw_g4_ruler <- function(g4_df, y, region_start, region_end) {
+  g4_color <- "#008080"
+  ruler_color <- adjustcolor("#4A4A4A", alpha.f = 0.65)
+  tick_half_height <- 0.18
+
+  segments(region_start, y, region_end, y, col = ruler_color, lwd = 1)
+  text(
+    x = region_start,
+    y = y + 0.21,
+    labels = "G4 motifs",
+    pos = 4,
+    offset = 0.2,
+    cex = 0.6,
+    font = 2,
+    col = "black"
+  )
+
+  invisible(lapply(seq_len(nrow(g4_df)), function(i) {
+    motif_start <- g4_df$start[[i]]
+    motif_end <- g4_df$end[[i]]
+    motif_center <- (motif_start + motif_end) / 2
+
+    segments(motif_start, y, motif_end, y, col = g4_color, lwd = 2)
+    segments(
+      c(motif_start, motif_end),
+      c(y - tick_half_height, y - tick_half_height),
+      c(motif_start, motif_end),
+      c(y + tick_half_height, y + tick_half_height),
+      col = g4_color,
+      lwd = 2
+    )
+
+    if ((motif_end - motif_start) < 2) {
+      segments(motif_center, y - 0.22, motif_center, y + 0.22, col = g4_color, lwd = 2.2)
+    }
+  }))
+}
+
 render_feature_plot <- function(plot_start, plot_end, outpath, plot_chrom = chrom_input) {
   requested_chrom <- resolve_chromosome(plot_chrom)
   feature_df <- read_features_from_gff(gff_file, requested_chrom, plot_start, plot_end)
+  g4_df <- read_g4_from_bed(g4_bed_file, requested_chrom, plot_start, plot_end)
 
-  if (nrow(feature_df) == 0) {
+  if (nrow(feature_df) == 0 && nrow(g4_df) == 0) {
     make_placeholder_plot(
-      "No genes or genomic features were found in the requested W303 region.",
+      "No genes, genomic features, or G4 motifs were found in the requested W303 region.",
       plot_start,
       plot_end,
       outpath
@@ -520,7 +618,9 @@ render_feature_plot <- function(plot_start, plot_end, outpath, plot_chrom = chro
   rownames(feature_df) <- NULL
 
   region_span <- max(1L, plot_end - plot_start + 1L)
-  plot_height_inches <- max(5.9, 2.1 + 0.32 * nrow(feature_df))
+  extra_rows <- if (nrow(g4_df) > 0) 1L else 0L
+  total_rows <- nrow(feature_df) + extra_rows
+  plot_height_inches <- max(5.9, 2.1 + 0.32 * total_rows)
 
   png(outpath, width = 3200, height = plot_height_inches * 200, res = 200)
   par(
@@ -532,7 +632,7 @@ render_feature_plot <- function(plot_start, plot_end, outpath, plot_chrom = chro
   plot(
     NA,
     xlim = c(plot_start, plot_end),
-    ylim = c(0.5, nrow(feature_df) + 1.2),
+    ylim = c(0.5, total_rows + 1.2),
     xaxt = "n",
     yaxt = "n",
     xlab = "",
@@ -563,22 +663,36 @@ render_feature_plot <- function(plot_start, plot_end, outpath, plot_chrom = chro
   )
 
   legend_types <- unique(feature_df$feature_type)
+  if (nrow(g4_df) > 0) {
+    legend_types <- unique(c(legend_types, "g4_motif"))
+  }
   legend_order <- unname(feature_rank[legend_types])
   legend_order[is.na(legend_order)] <- 999L
   legend_types <- legend_types[order(legend_order, legend_types)]
 
   abline(v = axis_ticks, col = "#EAEAEA", lwd = 0.8)
 
-  y_positions <- rev(seq_len(nrow(feature_df)))
-  invisible(lapply(seq_len(nrow(feature_df)), function(i) {
-    draw_feature_ruler(
-      feature_df[i, , drop = FALSE],
-      y = y_positions[[i]],
+  if (nrow(feature_df) > 0) {
+    feature_y_positions <- rev(seq(from = 1L + extra_rows, length.out = nrow(feature_df)))
+    invisible(lapply(seq_len(nrow(feature_df)), function(i) {
+      draw_feature_ruler(
+        feature_df[i, , drop = FALSE],
+        y = feature_y_positions[[i]],
+        region_start = plot_start,
+        region_end = plot_end,
+        region_span = region_span
+      )
+    }))
+  }
+
+  if (nrow(g4_df) > 0) {
+    draw_g4_ruler(
+      g4_df,
+      y = 1,
       region_start = plot_start,
-      region_end = plot_end,
-      region_span = region_span
+      region_end = plot_end
     )
-  }))
+  }
 
   legend(
     "bottom",
