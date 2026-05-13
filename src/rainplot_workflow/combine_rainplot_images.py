@@ -52,6 +52,16 @@ def stack_images(top_path, bottom_path, output_path):
         canvas.save(output_path)
 
 
+def resolve_annotation_path(rainplot_path, shared_annotation_path):
+    annotation_name = os.path.basename(rainplot_path).replace(
+        "rainplot_", "annotation_", 1
+    )
+    candidate = os.path.join(os.path.dirname(rainplot_path), annotation_name)
+    if os.path.exists(candidate):
+        return candidate
+    return shared_annotation_path
+
+
 def main():
     args = parse_args()
     rainplot_paths = read_manifest(args.manifest)
@@ -70,12 +80,20 @@ def main():
 
     for rainplot_path in rainplot_paths:
         rainplot_name = os.path.basename(rainplot_path)
-        output_path = os.path.join(args.output_dir, rainplot_name)
-        stack_images(rainplot_path, args.annotation_png, output_path)
+        combined_name = rainplot_name.replace("rainplot_", "combined_1", 1)
+        output_path = os.path.join(args.output_dir, combined_name)
+        annotation_path = resolve_annotation_path(rainplot_path, args.annotation_png)
+        stack_images(rainplot_path, annotation_path, output_path)
         print(f"[INFO] Combined plot written to: {output_path}", flush=True)
 
         if args.delete_inputs and os.path.exists(rainplot_path):
             os.remove(rainplot_path)
+        if (
+            args.delete_inputs
+            and annotation_path != args.annotation_png
+            and os.path.exists(annotation_path)
+        ):
+            os.remove(annotation_path)
 
     if args.delete_inputs and os.path.exists(args.annotation_png):
         os.remove(args.annotation_png)
