@@ -12,6 +12,7 @@
 set -euo pipefail
 
 module load python/3.13.7
+module load modkit
 module load samtools
 module load R/4.5.2
 
