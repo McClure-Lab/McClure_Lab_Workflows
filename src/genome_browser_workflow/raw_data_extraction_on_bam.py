@@ -1,368 +1,254 @@
 #!/usr/bin/env python3
-import pysam
+"""
+Create strand-specific BrdU bedgraph files from a BAM using modkit pileup.
+
+Outputs are written to data/bedgraph by default and contain six tab-delimited
+columns:
+    chrom, start, end, frac_mod, Nmod, Nvalid_cov
+"""
+
 import argparse
+import os
+import shutil
 import subprocess
 import sys
-import os
-import tempfile
-import shutil
-from collections import defaultdict
+from pathlib import Path
+
+import pysam
 
 
 def parse_args():
-    """
-    Parse command line arguments for genome browser BrdU extraction.
-
-    Required:
-        bam: Path to input BAM file
-
-    Optional:
-        -o / --output: Output prefix for generated bedgraph files
-
-    Returns:
-        argparse.Namespace with parsed arguments
-    """
     parser = argparse.ArgumentParser(
-        description="Extract genome-wide BrdU bedgraph data from a BAM file using modkit."
+        description="Extract positive and negative strand BrdU bedgraphs from a BAM."
     )
-    parser.add_argument("bam")
     parser.add_argument(
-        "-o", "--output", default=None,
-        help="Optional output prefix for generated bedgraph files."
+        "bam",
+        help="BAM filename in data/bam or an explicit path to a BAM file.",
+    )
+    parser.add_argument(
+        "--ref",
+        required=True,
+        help="Reference FASTA used by modkit pileup.",
+    )
+    parser.add_argument(
+        "-o",
+        "--output-prefix",
+        default=None,
+        help="Output prefix. Defaults to the input BAM basename without .bam.",
+    )
+    parser.add_argument(
+        "--threads",
+        type=int,
+        default=12,
+        help="Threads passed to modkit pileup.",
+    )
+    parser.add_argument(
+        "--bedgraph-dir",
+        default=None,
+        help="Output directory for generated bedgraph files.",
     )
     return parser.parse_args()
 
 
-def get_project_paths():
-    """
-    Resolve key project directories relative to this script.
-
-    Returns:
-        sorted_bam_dir: Directory where sorted BAM files are stored
-        index_dir: Directory where archived BAM index (.bai) files are stored
-        bedgraph_dir: Directory where output bedgraph files are saved
-        bam_dir: Directory where original BAM files are stored
-    """
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-
-    sorted_bam_dir = os.path.abspath(
-        os.path.join(script_dir, "../../data/sorted_bam")
-    )
-    index_dir = os.path.abspath(
-        os.path.join(script_dir, "../../data/index_sorted_bam_bai")
-    )
-    bedgraph_dir = os.path.abspath(
-        os.path.join(script_dir, "../../data/bedgraph")
-    )
-    bam_dir = os.path.abspath(
-        os.path.join(script_dir, "../../data/bam")
-    )
-
-    return sorted_bam_dir, index_dir, bedgraph_dir, bam_dir
+def repo_root():
+    return Path(__file__).resolve().parents[2]
 
 
-def resolve_bam_path(bam_input, bam_dir):
-    """
-    Resolve the BAM path provided by the user.
-
-    If the BAM path exists as provided, use it directly.
-    Otherwise, look for the BAM file in data/bam.
-
-    Args:
-        bam_input: User-provided BAM path or filename
-        bam_dir: Default BAM directory in the workflow
-
-    Returns:
-        Resolved BAM path
-
-    Raises:
-        SystemExit if the BAM cannot be found
-    """
-    if os.path.exists(bam_input):
-        return os.path.abspath(bam_input)
-
-    candidate = os.path.join(bam_dir, bam_input)
-    if os.path.exists(candidate):
-        return os.path.abspath(candidate)
-
-    print(f"[ERROR] BAM not found: {bam_input}", file=sys.stderr)
-    sys.exit(1)
+def project_paths():
+    root = repo_root()
+    return {
+        "bam_dir": root / "data" / "bam",
+        "sorted_bam_dir": root / "data" / "sorted_bam",
+        "index_dir": root / "data" / "index_sorted_bam_bai",
+        "bedgraph_dir": root / "data" / "bedgraph",
+    }
 
 
-def check_and_sort_bam(bam_path, sorted_bam_dir):
-    """
-    Check if a BAM file is coordinate-sorted. If not, sort it using samtools.
+def resolve_existing_path(value, fallback_dir=None, description="file"):
+    path = Path(value).expanduser()
 
-    If the BAM is already sorted, it is copied into the standardized location.
-    All BAM files are renamed to a consistent format:
-        <original>.sorted.indexed.bam
+    if path.exists():
+        return path.resolve()
 
-    Args:
-        bam_path: Path to input BAM file
-        sorted_bam_dir: Directory to store sorted BAM files
+    if fallback_dir is not None:
+        candidate = fallback_dir / value
+        if candidate.exists():
+            return candidate.resolve()
 
-    Returns:
-        Path to sorted BAM file
-    """
-    bam = pysam.AlignmentFile(bam_path, "rb", check_sq=False)
-    header = bam.header.to_dict()
-    bam.close()
+    raise FileNotFoundError(f"{description} not found: {value}")
 
-    sort_order = header.get("HD", {}).get("SO", "unknown")
 
-    os.makedirs(sorted_bam_dir, exist_ok=True)
+def strip_bam_suffix(path):
+    name = Path(path).name
+    return name[:-4] if name.endswith(".bam") else Path(name).stem
 
-    original_base = os.path.splitext(os.path.basename(bam_path))[0]
 
-    if original_base.endswith(".sorted"):
-        original_base = original_base[:-7]
+def standardized_bam_name(input_bam):
+    base = strip_bam_suffix(input_bam)
 
-    standardized_filename = f"{original_base}.sorted.indexed.bam"
-    standardized_path = os.path.join(sorted_bam_dir, standardized_filename)
+    if base.endswith(".sorted.indexed"):
+        base = base[: -len(".sorted.indexed")]
+    elif base.endswith(".sorted"):
+        base = base[: -len(".sorted")]
 
-    if os.path.exists(standardized_path):
-        print(f"[INFO] Reusing standardized BAM: {standardized_path}", file=sys.stderr)
-        return standardized_path
+    return f"{base}.sorted.indexed.bam"
+
+
+def check_and_sort_bam(input_bam, sorted_bam_dir):
+    sorted_bam_dir.mkdir(parents=True, exist_ok=True)
+    output_bam = sorted_bam_dir / standardized_bam_name(input_bam)
+
+    if output_bam.exists() and output_bam.stat().st_mtime >= input_bam.stat().st_mtime:
+        print(f"[INFO] Reusing sorted BAM: {output_bam}", file=sys.stderr)
+        return output_bam
+
+    with pysam.AlignmentFile(str(input_bam), "rb", check_sq=False) as bam:
+        sort_order = bam.header.to_dict().get("HD", {}).get("SO", "unknown")
 
     if sort_order == "coordinate":
-        print(f"[INFO] Copying sorted BAM → {standardized_path}", file=sys.stderr)
-        subprocess.run(["cp", bam_path, standardized_path], check=True)
-        return standardized_path
-
-    print(f"[INFO] Sorting BAM → {standardized_path}", file=sys.stderr)
-    subprocess.run(["samtools", "sort", "-o", standardized_path, bam_path], check=True)
-    return standardized_path
-
-
-def check_and_index_bam(bam_path, index_dir):
-    """
-    Ensure a BAM file has an up-to-date index.
-
-    The archived index is stored in:
-        data/index_sorted_bam_bai/
-
-    The archived index filename is:
-        <bam_filename>.bai
-
-    An adjacent BAM index is also created next to the BAM so tools like modkit
-    can find it automatically.
-
-    If the archived index is missing or older than the BAM file, it is rebuilt.
-
-    Args:
-        bam_path: Path to BAM file
-        index_dir: Directory where archived index files are stored
-
-    Returns:
-        Path to archived index file
-    """
-    bam_basename = os.path.basename(bam_path)
-    archived_index_path = os.path.join(index_dir, f"{bam_basename}.bai")
-    adjacent_index_path = f"{bam_path}.bai"
-
-    os.makedirs(index_dir, exist_ok=True)
-
-    rebuild = False
-
-    if not os.path.exists(archived_index_path):
-        print("[INFO] No index found. Creating index...", file=sys.stderr)
-        rebuild = True
+        print(f"[INFO] Copying coordinate-sorted BAM to {output_bam}", file=sys.stderr)
+        shutil.copy2(input_bam, output_bam)
     else:
-        if os.path.getmtime(archived_index_path) < os.path.getmtime(bam_path):
-            print("[INFO] Index older than BAM. Rebuilding index...", file=sys.stderr)
-            rebuild = True
-        else:
-            print(f"[INFO] Index found: {archived_index_path}", file=sys.stderr)
+        print(f"[INFO] Sorting BAM with samtools: {output_bam}", file=sys.stderr)
+        subprocess.run(
+            ["samtools", "sort", "-o", str(output_bam), str(input_bam)],
+            check=True,
+        )
 
-    if rebuild:
-        subprocess.run(["samtools", "index", bam_path], check=True)
-        print(f"[INFO] Adjacent BAM index created: {adjacent_index_path}", file=sys.stderr)
+    return output_bam
 
-        shutil.copy2(adjacent_index_path, archived_index_path)
-        print(f"[INFO] Archived index created: {archived_index_path}", file=sys.stderr)
+
+def check_and_index_bam(sorted_bam, index_dir):
+    index_dir.mkdir(parents=True, exist_ok=True)
+
+    adjacent_index = Path(f"{sorted_bam}.bai")
+    archived_index = index_dir / f"{sorted_bam.name}.bai"
+
+    needs_index = (
+        not adjacent_index.exists()
+        or adjacent_index.stat().st_mtime < sorted_bam.stat().st_mtime
+    )
+
+    if needs_index:
+        print(f"[INFO] Indexing BAM with samtools: {sorted_bam}", file=sys.stderr)
+        subprocess.run(["samtools", "index", str(sorted_bam)], check=True)
     else:
-        if not os.path.exists(adjacent_index_path):
-            shutil.copy2(archived_index_path, adjacent_index_path)
-            print(f"[INFO] Restored adjacent BAM index: {adjacent_index_path}", file=sys.stderr)
+        print(f"[INFO] Reusing adjacent BAM index: {adjacent_index}", file=sys.stderr)
 
-    return archived_index_path
+    if (
+        not archived_index.exists()
+        or archived_index.stat().st_mtime < adjacent_index.stat().st_mtime
+    ):
+        shutil.copy2(adjacent_index, archived_index)
+        print(f"[INFO] Archived BAM index: {archived_index}", file=sys.stderr)
 
-
-def extract_brdu_with_modkit(bam_path):
-    """
-    Run modkit extract full on the BAM file to obtain per-base modification data.
-
-    Uses tempfile.mkstemp to generate a safe, unique output path, then removes
-    the placeholder so modkit can write to that path (modkit refuses to overwrite
-    existing files).
-
-    Args:
-        bam_path: Path to sorted and indexed BAM file
-
-    Returns:
-        Path to the modkit output TSV file (caller is responsible for deletion)
-    """
-    fd, temp_output = tempfile.mkstemp(suffix=".tsv", prefix="modkit_extract_")
-    os.close(fd)
-    os.remove(temp_output)  # modkit refuses to overwrite existing files
-
-    cmd = ["modkit", "extract", "full", bam_path, temp_output]
-
-    print(f"[INFO] Running modkit extraction on {bam_path}", file=sys.stderr)
-
-    # stderr=None streams modkit's progress and errors live to the terminal
-    result = subprocess.run(cmd, stderr=None)
-
-    if result.returncode != 0:
-        print(f"[ERROR] modkit exited with code {result.returncode}.", file=sys.stderr)
-        if os.path.exists(temp_output):
-            os.remove(temp_output)
-        sys.exit(1)
-
-    if not os.path.exists(temp_output) or os.path.getsize(temp_output) == 0:
-        print("[ERROR] modkit output file was not created or is empty.", file=sys.stderr)
-        if os.path.exists(temp_output):
-            os.remove(temp_output)
-        sys.exit(1)
-
-    return temp_output
+    return adjacent_index
 
 
-def aggregate_bedgraph(temp_output):
-    """
-    Aggregate modkit output into bedgraph format for positive and negative strands.
+def run_modkit_pileup(sorted_bam, reference, output_prefix, bedgraph_dir, threads):
+    bedgraph_dir.mkdir(parents=True, exist_ok=True)
 
-    Streams the modkit TSV line by line to avoid loading 50M+ lines into memory
-    at once. Cleans up the temp file after processing.
+    bedmethyl = bedgraph_dir / f"{output_prefix}.full.bedmethyl"
+    positive = bedgraph_dir / f"{output_prefix}.positive.bedgraph"
+    negative = bedgraph_dir / f"{output_prefix}.negative.bedgraph"
+    log_path = bedgraph_dir / f"{output_prefix}.modkit.log"
 
-    For each genomic position:
-        coverage = number of reads covering T
-        BrdU count = number of reads with mod_code == 'b'
+    for generated_path in (bedmethyl, positive, negative, log_path):
+        if generated_path.exists():
+            generated_path.unlink()
 
-    The output bedgraph will contain:
-        chrom, start, end, brdu_fraction, coverage
+    cmd = [
+        "modkit",
+        "pileup",
+        str(sorted_bam),
+        str(bedmethyl),
+        "--ref",
+        str(reference),
+        "--threads",
+        str(threads),
+        "--only-tabs",
+        "--log-filepath",
+        str(log_path),
+    ]
 
-    Args:
-        temp_output: Path to modkit TSV file (will be deleted after processing)
+    print("[INFO] Running modkit pileup.", file=sys.stderr)
+    subprocess.run(cmd, check=True)
 
-    Returns:
-        positive_data: dict for '+' strand
-        negative_data: dict for '-' strand
-    """
-    positive_data = defaultdict(lambda: [0, 0])
-    negative_data = defaultdict(lambda: [0, 0])
+    write_strand_bedgraphs(bedmethyl, positive, negative)
 
-    with open(temp_output, "r") as infile:
-        for line in infile:
-            line = line.strip()
-            if not line:
+    return positive, negative, bedmethyl
+
+
+def write_strand_bedgraphs(bedmethyl, positive_output, negative_output):
+    with open(bedmethyl, "r") as source, open(positive_output, "w") as pos, open(
+        negative_output, "w"
+    ) as neg:
+        for line in source:
+            if not line.strip() or line.startswith("#"):
                 continue
 
-            parts = line.split("\t")
+            fields = line.rstrip("\n").split("\t")
 
-            if len(parts) < 21:
+            if len(fields) < 12:
                 continue
 
-            if parts[0] == "read_id":
-                continue
+            mod_code = fields[3]
+            strand = fields[5]
 
-            ref_position = parts[2]
-            chrom = parts[3]
-            ref_strand = parts[5]
-            mod_code = parts[13]
-            canonical_base = parts[17]
-
-            if canonical_base != "T":
+            if mod_code != "b" or strand not in {"+", "-"}:
                 continue
 
             try:
-                ref_position = int(ref_position)
+                valid_cov = float(fields[9])
+                n_mod = float(fields[11])
             except ValueError:
                 continue
 
-            key = (chrom, ref_position, ref_position + 1)
+            frac_mod = n_mod / valid_cov if valid_cov > 0 else 0.0
+            output_line = (
+                f"{fields[0]}\t{fields[1]}\t{fields[2]}\t"
+                f"{frac_mod:.8g}\t{n_mod:.0f}\t{valid_cov:.0f}\n"
+            )
 
-            if ref_strand == "+":
-                target = positive_data
-            elif ref_strand == "-":
-                target = negative_data
+            if strand == "+":
+                pos.write(output_line)
             else:
-                continue
-
-            target[key][1] += 1
-
-            if mod_code == "b":
-                target[key][0] += 1
-
-    os.remove(temp_output)
-
-    return positive_data, negative_data
-
-
-def write_bedgraph(data, output_file):
-    """
-    Write aggregated data to a bedgraph file.
-
-    Each line contains:
-        chrom, start, end, brdu_fraction, coverage
-
-    Args:
-        data: Dictionary of aggregated values
-        output_file: Path to output bedgraph file
-    """
-    with open(output_file, "w") as out:
-        for (chrom, start, end), (brdu_count, coverage) in sorted(
-            data.items(), key=lambda x: (x[0][0], x[0][1])
-        ):
-            if coverage == 0:
-                continue
-
-            brdu_fraction = brdu_count / coverage
-            out.write(f"{chrom}\t{start}\t{end}\t{brdu_fraction:.8g}\t{coverage}\n")
+                neg.write(output_line)
 
 
 def main():
-    """
-    Main workflow:
-    1. Resolve the BAM path
-    2. Ensure the BAM is sorted
-    3. Ensure the BAM is indexed
-    4. Extract modkit data
-    5. Aggregate the output into bedgraph format
-    6. Write positive and negative strand bedgraph files
-    """
     args = parse_args()
+    paths = project_paths()
 
-    sorted_dir, index_dir, bedgraph_dir, bam_dir = get_project_paths()
-    os.makedirs(bedgraph_dir, exist_ok=True)
+    try:
+        input_bam = resolve_existing_path(args.bam, paths["bam_dir"], "BAM")
+        reference = resolve_existing_path(args.ref, None, "reference FASTA")
+    except FileNotFoundError as error:
+        print(f"[ERROR] {error}", file=sys.stderr)
+        sys.exit(1)
 
-    input_bam = resolve_bam_path(args.bam, bam_dir)
-
-    bam_path = check_and_sort_bam(input_bam, sorted_dir)
-    check_and_index_bam(bam_path, index_dir)
-
-    temp_output = extract_brdu_with_modkit(bam_path)
-    positive_data, negative_data = aggregate_bedgraph(temp_output)
-
-    bam_base = os.path.splitext(os.path.basename(args.bam))[0]
-
-    if args.output:
-        output_prefix = args.output
-    else:
-        output_prefix = bam_base
-
-    positive_output = os.path.join(
-        bedgraph_dir, f"{output_prefix}_positive.bedgraph"
-    )
-    negative_output = os.path.join(
-        bedgraph_dir, f"{output_prefix}_negative.bedgraph"
+    bedgraph_dir = (
+        Path(args.bedgraph_dir).expanduser().resolve()
+        if args.bedgraph_dir
+        else paths["bedgraph_dir"]
     )
 
-    write_bedgraph(positive_data, positive_output)
-    write_bedgraph(negative_data, negative_output)
+    output_prefix = args.output_prefix or strip_bam_suffix(input_bam)
 
-    print(f"[INFO] Positive strand bedgraph written to {positive_output}", file=sys.stderr)
-    print(f"[INFO] Negative strand bedgraph written to {negative_output}", file=sys.stderr)
+    sorted_bam = check_and_sort_bam(input_bam, paths["sorted_bam_dir"])
+    check_and_index_bam(sorted_bam, paths["index_dir"])
+
+    positive, negative, bedmethyl = run_modkit_pileup(
+        sorted_bam=sorted_bam,
+        reference=reference,
+        output_prefix=output_prefix,
+        bedgraph_dir=bedgraph_dir,
+        threads=args.threads,
+    )
+
+    print(f"[INFO] Bedmethyl written to {bedmethyl}", file=sys.stderr)
+    print(f"[INFO] Positive strand bedgraph written to {positive}", file=sys.stderr)
+    print(f"[INFO] Negative strand bedgraph written to {negative}", file=sys.stderr)
 
 
 if __name__ == "__main__":
