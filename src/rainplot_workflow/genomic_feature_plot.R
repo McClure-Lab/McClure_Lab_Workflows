@@ -579,7 +579,13 @@ draw_direction_backdrop <- function(region_start, region_end, y, strand_value, c
   # direction of the feature without needing a separate strand label.
   step <- max(400L, ceiling(region_span / 32))
   arrow_len <- step * 0.7
-  centers <- seq(region_start + step / 2, region_end - step / 2, by = step)
+  first_center <- region_start + step / 2
+  last_center <- region_end - step / 2
+  if (first_center > last_center) {
+    return(invisible(NULL))
+  }
+
+  centers <- seq(first_center, last_center, by = step)
   if (length(centers) == 0) {
     return(invisible(NULL))
   }
@@ -762,11 +768,13 @@ render_feature_plot <- function(plot_start, plot_end, outpath, plot_chrom = chro
 
   # Sort features by biological category first, then genomic position.
   # This keeps similar feature types grouped together in the final figure.
-  feature_order <- unname(feature_rank[feature_df$feature_type])
-  feature_order[is.na(feature_order)] <- 999L
+  if (nrow(feature_df) > 0) {
+    feature_order <- unname(feature_rank[feature_df$feature_type])
+    feature_order[is.na(feature_order)] <- 999L
 
-  feature_df <- feature_df[order(feature_order, feature_df$raw_start, feature_df$raw_end, feature_df$name), ]
-  rownames(feature_df) <- NULL
+    feature_df <- feature_df[order(feature_order, feature_df$raw_start, feature_df$raw_end, feature_df$name), ]
+    rownames(feature_df) <- NULL
+  }
 
   # Make the PNG taller as more annotation rows are added.
   # This prevents labels from being squeezed together in dense regions.
