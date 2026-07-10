@@ -126,16 +126,20 @@ source "$VENV_DIR/bin/activate"
 echo "[INFO] Installing Python requirements."
 python -m pip install -r "$SRC_DIR/requirements.txt" --quiet
 
-echo "[INFO] Running raw BrdU bedgraph extraction."
-python "$SRC_DIR/raw_data_extraction_on_bam.py" \
-    "$BAM_PATH" \
-    --ref "$REF_PATH" \
-    --output-prefix "$OUTPUT_PREFIX" \
-    --threads "${SLURM_CPUS_PER_TASK:-12}" \
-    --bedgraph-dir "$BEDGRAPH_DIR"
-
 POSITIVE_OUTPUT="$BEDGRAPH_DIR/$OUTPUT_PREFIX.positive.bedgraph"
 NEGATIVE_OUTPUT="$BEDGRAPH_DIR/$OUTPUT_PREFIX.negative.bedgraph"
+
+if [[ -s "$POSITIVE_OUTPUT" && -s "$NEGATIVE_OUTPUT" ]]; then
+    echo "[INFO] Reusing existing bedgraph files for prefix: $OUTPUT_PREFIX"
+else
+    echo "[INFO] Running raw BrdU bedgraph extraction."
+    python "$SRC_DIR/raw_data_extraction_on_bam.py" \
+        "$BAM_PATH" \
+        --ref "$REF_PATH" \
+        --output-prefix "$OUTPUT_PREFIX" \
+        --threads "${SLURM_CPUS_PER_TASK:-12}" \
+        --bedgraph-dir "$BEDGRAPH_DIR"
+fi
 
 if [[ ! -s "$POSITIVE_OUTPUT" ]]; then
     echo "[ERROR] Positive bedgraph file is empty or missing: $POSITIVE_OUTPUT"

@@ -3,6 +3,7 @@
 Generate smoothed per-chromosome BrdU genome browser plots.
 """
 
+# Required imports and libraries
 import argparse
 import os
 import sys
@@ -21,6 +22,7 @@ plt.rcParams["agg.path.chunksize"] = 10000
 
 SUBTEL_SIZE = 30000
 
+# Genbank ID's mapped to their corresponding chromosome
 GENBANK_TO_CHR = {
     "CM007964.1": "1",
     "CM007965.1": "2",
@@ -42,6 +44,7 @@ GENBANK_TO_CHR = {
     "CM007981.1": "MT",
 }
 
+# NCBI RefSeq ID mapped to their correspondng chromosome
 NCBI_REFSEQ_TO_CHR = {
     "NC_001133.9": "1",
     "NC_001134.8": "2",
@@ -62,6 +65,7 @@ NCBI_REFSEQ_TO_CHR = {
     "NC_001224.1": "MT",
 }
 
+# Chromosomes mapped to their corresponding lengths
 CHROM_LENGTHS = {
     "1": 230218,
     "2": 813184,
@@ -85,6 +89,9 @@ CHROM_LENGTHS = {
 
 
 def repo_root():
+    """
+    Makes sure the script is running from the project root directory
+    """
     return Path(__file__).resolve().parents[2]
 
 
@@ -103,6 +110,14 @@ def parse_args():
 
 
 def add_common_args(parser):
+    """
+    Looking for all of the required datasets in order to generate the genome 
+    browsers. It will go to the project root directory and look for the
+    positve/negative bedgraph files, along with our required genes/genomic feature
+    .bed files (G4 motifs, tRNA, transposable elements). Based on our .bam file input
+    genome browser output will have that prefix, so we can tell the differences 
+    between our genome browsers.
+    """
     root = repo_root()
     bed_dir = root / "data" / "bed"
     parser.add_argument("--positive-bedgraph", required=True)
@@ -134,6 +149,10 @@ def add_common_args(parser):
 
 
 def map_chromosome(chrom_id: str) -> Optional[str]:
+    """
+    Mapping all of our chromosome to the correct Gen Bank ID, NCBI RefSeq ID,
+    and their chromosome lenghts for yeast (e.g. W303 strain).
+    """
     chrom = str(chrom_id)
 
     if chrom in GENBANK_TO_CHR:
@@ -161,6 +180,9 @@ def chrom_sort_key(value):
 
 
 def load_bedgraph(path):
+    """
+    Loading our bedgraph files into a pandas dataframe.
+    """
     columns = ["chrom", "start", "end", "frac_mod", "Nmod", "Nvalid_cov"]
     df = pd.read_csv(path, sep="\t", header=None, names=columns)
 
@@ -175,6 +197,12 @@ def load_bedgraph(path):
 
 
 def prepare_dataframe(positive_bedgraph, negative_bedgraph):
+    """
+    Loading both the positive and negative bedgraph files and
+    combining them into a single bedgraph file. This bedgraph
+    file is going to be used to generate our genome browser
+    plots. 
+    """
     pos_df = load_bedgraph(positive_bedgraph)
     neg_df = load_bedgraph(negative_bedgraph)
 
@@ -187,6 +215,14 @@ def prepare_dataframe(positive_bedgraph, negative_bedgraph):
 
 
 def load_feature_bed(path, description):
+    """
+    Load a BED-like feature file into a standardized DataFrame.
+
+    Keeps up to six BED columns as chrom, start, end, name, score, and strand,
+    fills missing optional columns with ".", normalizes chromosome names, and
+    removes rows with invalid coordinates. Returns an empty DataFrame and prints
+    a warning if the file is missing or invalid.
+    """
     columns = ["chrom", "start", "end", "name", "score", "strand"]
 
     if not path:
@@ -218,6 +254,11 @@ def load_feature_bed(path, description):
 
 
 def combine_strands(chrom_df):
+    """
+    Combining the positive and negative strands. We do this to make sure we 
+    are not throwing away any of the strands and using both of them to 
+    generate the genome browsers.
+    """
     combined = (
         chrom_df.groupby(["chrom", "start", "end"], as_index=False)
         .agg(Nmod=("Nmod", "sum"), Nvalid_cov=("Nvalid_cov", "sum"))
@@ -233,6 +274,13 @@ def combine_strands(chrom_df):
 
 
 def smooth_signals(chrom_df, window):
+    """
+    Add smoothed coverage, BrdU count, and BrdU percentage columns.
+
+    Uses a centered rolling window to smooth Nvalid_cov and Nmod, then calculates
+    BrdU_pct_plot as 100 * summed Nmod / summed Nvalid_cov within the same
+    window. Returns the updated chromosome DataFrame.
+    """
     chrom_df["Coverage_plot"] = (
         chrom_df["Nvalid_cov"].rolling(window=window, min_periods=1, center=True).mean()
     )
@@ -254,6 +302,9 @@ def smooth_signals(chrom_df, window):
 
 
 def use_raw_signals(chrom_df):
+    """
+    Uses the raw signals for the coverage, BrdU count, and BrdU % without smoothing
+    """
     chrom_df["Coverage_plot"] = chrom_df["Nvalid_cov"]
     chrom_df["BrdU_plot"] = chrom_df["Nmod"]
     chrom_df["BrdU_pct_plot"] = chrom_df["BrdU_pct"]
@@ -261,6 +312,13 @@ def use_raw_signals(chrom_df):
 
 
 def binned_signal(x, y, chr_length, bin_size):
+    """
+    Average signal values into fixed-width genomic bins.
+
+    Creates bins across the chromosome, assigns each x position to a bin, and
+    returns the bin centers with the mean y value per bin. Empty bins and bins
+    with no finite signal values are returned as 0.
+    """
     if bin_size <= 0:
         bin_size = 2500
 
@@ -291,6 +349,14 @@ def binned_signal(x, y, chr_length, bin_size):
 
 
 def plot_stick_ruler(ax, chrom_df, x_col, y_col, chr_length, bin_size, max_height=1.0):
+    """
+    Plot a binned signal track as vertical stick marks.
+
+    Bins the selected x and y columns across the chromosome, scales each bin mean
+    relative to the maximum binned value, and draws vertical lines showing the
+    normalized signal height. Also formats the track axis and labels the raw
+    maximum binned value.
+    """
     x = chrom_df[x_col].to_numpy(dtype=np.float64)
     y = chrom_df[y_col].to_numpy(dtype=np.float64)
     centers, binned = binned_signal(x, y, chr_length=chr_length, bin_size=bin_size)
@@ -312,6 +378,12 @@ def plot_stick_ruler(ax, chrom_df, x_col, y_col, chr_length, bin_size, max_heigh
 
 
 def plot_feature_track(ax, features_df, chr_length, color):
+    """
+    Plot genomic features as vertical marks along a chromosome track.
+
+    Uses the midpoint of each feature interval, clips positions to chromosome
+    bounds, and alternates mark height to make nearby features easier to see.
+    """
     ax.axhline(0, linewidth=0.8)
 
     if len(features_df) > 0:
@@ -326,6 +398,12 @@ def plot_feature_track(ax, features_df, chr_length, color):
 
 
 def plot_subtel_track(ax, chr_length):
+    """
+    Plot subtelomeric regions at both chromosome ends.
+
+    Draws red blocks from 0 to SUBTEL_SIZE and from chr_length - SUBTEL_SIZE to
+    chr_length, clipping the regions so they stay within chromosome bounds.
+    """
     ax.axhline(0, linewidth=0.8)
     left_end = min(SUBTEL_SIZE, chr_length)
     right_start = max(0, chr_length - SUBTEL_SIZE)
@@ -346,6 +424,12 @@ def plot_subtel_track(ax, chr_length):
 
 
 def format_track_axis(ax, chr_length, ymax, ymin=-0.02):
+    """
+    Apply shared formatting to compact genome browser tracks.
+
+    Sets chromosome-scale x limits, vertical limits, hides y-axis labels and
+    unused spines, adds a light x-axis grid, and removes x tick labels.
+    """
     ax.set_xlim(0, chr_length)
     ax.set_ylim(ymin, ymax)
     ax.set_yticks([])
@@ -357,6 +441,13 @@ def format_track_axis(ax, chr_length, ymax, ymin=-0.02):
 
 
 def add_all_rulers_panel(fig, gs_slot, ax_sharex, chrom_df, chr_length, features, bin_size):
+    """
+    Add the full stacked ruler panel below the main chromosome plot.
+
+    Creates labeled tracks for coverage, BrdU count, BrdU percentage, G4 motifs,
+    tRNAs, TEs, and subtelomeric regions. Signal tracks are binned stick rulers,
+    feature tracks are vertical markers, and all tracks share the main x-axis.
+    """
     sub = gs_slot.subgridspec(
         7,
         2,
@@ -404,6 +495,12 @@ def add_all_rulers_panel(fig, gs_slot, ax_sharex, chrom_df, chr_length, features
 
 
 def replace_axis_label(ax, smooth, raw, label_smooth, label_raw):
+    """
+    Replace the default max label on a ruler axis.
+
+    Removes any existing text label that starts with "max=", then adds a new
+    label showing the smoothed value and, optionally, the raw value.
+    """
     for text in list(ax.texts):
         if text.get_text().startswith("max="):
             text.remove()
@@ -425,6 +522,12 @@ def replace_axis_label(ax, smooth, raw, label_smooth, label_raw):
 
 
 def add_ruler_max_labels(ruler_axes, chrom_df, smoothed):
+    """
+    Add max-value labels to the coverage, BrdU, and BrdU percentage ruler tracks.
+
+    For smoothed plots, labels each track with both the smoothed maximum and raw
+    maximum. For unsmoothed plots, labels each track with only the raw maximum.
+    """
     if smoothed:
         replace_axis_label(
             ruler_axes["coverage"],
@@ -472,6 +575,13 @@ def add_ruler_max_labels(ruler_axes, chrom_df, smoothed):
 
 
 def downsampled_main_signal(chrom_df, chr_length, smoothed):
+    """
+    Prepare coverage and BrdU signals for the main chromosome plot.
+
+    For smoothed plots, returns the full smoothed signal as line data. For
+    unsmoothed plots, downsamples large datasets, bins the signal across the
+    chromosome, and returns step-style plotting data.
+    """
     if smoothed:
         return (
             chrom_df["start"].to_numpy(dtype=float),
@@ -492,6 +602,13 @@ def downsampled_main_signal(chrom_df, chr_length, smoothed):
 
 
 def plot_chromosome(chrom, chrom_df, features_by_chrom, output_dir, prefix, smoothed):
+    """
+    Plot coverage, BrdU signal, and genomic feature tracks for one chromosome.
+
+    Builds the main chromosome signal plot, highlights subtelomeric regions,
+    adds stacked ruler tracks for signal and feature annotations, labels ruler
+    maxima, saves the figure as a PNG, and returns the output path.
+    """
     chr_length = int(CHROM_LENGTHS.get(chrom, chrom_df["end"].max()))
     mode_label = "smoothed" if smoothed else "unsmoothed"
 
@@ -566,10 +683,21 @@ def plot_chromosome(chrom, chrom_df, features_by_chrom, output_dir, prefix, smoo
 
 
 def empty_feature_df():
+    """
+    Return an empty standardized feature DataFrame.
+
+    Uses the same BED-style columns expected by the feature plotting functions.
+    """
     return pd.DataFrame(columns=["chrom", "start", "end", "name", "score", "strand"])
 
 
 def group_features(features):
+    """
+    Group feature DataFrames by chromosome.
+
+    Converts each feature table into a dictionary keyed by chromosome so tracks
+    can be quickly retrieved during per-chromosome plotting.
+    """
     grouped = {}
     for key, df in features.items():
         grouped[key] = {chrom: sub for chrom, sub in df.groupby("chrom", sort=False)}
@@ -587,6 +715,13 @@ def generate_genome_browser(
     smoothed=True,
     window=1000,
 ):
+    """
+    Generate genome browser plots for all chromosomes in the input bedGraphs.
+
+    Loads positive and negative strand pileup data, prepares optional feature
+    tracks, creates either smoothed or raw signals for each chromosome, saves one
+    plot per chromosome, and returns the list of generated output paths.
+    """
     output_dir = Path(output_dir).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -624,6 +759,9 @@ def generate_genome_browser(
 
 
 def main():
+    """
+    Parse command-line arguments and run the genome browser plotting workflow.
+    """
     args = parse_args()
     generate_genome_browser(
         positive_bedgraph=args.positive_bedgraph,

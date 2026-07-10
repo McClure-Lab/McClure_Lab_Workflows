@@ -18,6 +18,12 @@ import pysam
 
 
 def parse_args():
+    """
+    Parse command-line arguments for BAM-to-bedGraph generation.
+
+    Collects the input BAM, reference FASTA, output prefix, thread count, and
+    optional bedGraph output directory.
+    """
     parser = argparse.ArgumentParser(
         description="Extract positive and negative strand BrdU bedgraphs from a BAM."
     )
@@ -51,10 +57,21 @@ def parse_args():
 
 
 def repo_root():
+    """
+    Return the repository root directory.
+
+    Assumes this script is located two directories below the project root.
+    """
     return Path(__file__).resolve().parents[2]
 
 
 def project_paths():
+    """
+    Return standard project directories used by the workflow.
+
+    Provides paths for input BAMs, sorted BAMs, BAM indexes, and generated
+    bedGraph files.
+    """
     root = repo_root()
     return {
         "bam_dir": root / "data" / "bam",
@@ -65,6 +82,12 @@ def project_paths():
 
 
 def resolve_existing_path(value, fallback_dir=None, description="file"):
+    """
+    Resolve an input path and confirm that it exists.
+
+    Checks the provided path first, then optionally checks inside a fallback
+    directory. Raises FileNotFoundError if neither path exists.
+    """
     path = Path(value).expanduser()
 
     if path.exists():
@@ -79,11 +102,22 @@ def resolve_existing_path(value, fallback_dir=None, description="file"):
 
 
 def strip_bam_suffix(path):
+    """
+    Return a BAM filename stem without the .bam suffix.
+
+    If the name does not end in .bam, returns the normal Path stem.
+    """
     name = Path(path).name
     return name[:-4] if name.endswith(".bam") else Path(name).stem
 
 
 def standardized_bam_name(input_bam):
+    """
+    Create the standardized sorted/indexed BAM filename.
+
+    Removes existing .sorted or .sorted.indexed suffixes from the input basename
+    and returns a name ending in .sorted.indexed.bam.
+    """
     base = strip_bam_suffix(input_bam)
 
     if base.endswith(".sorted.indexed"):
@@ -95,6 +129,13 @@ def standardized_bam_name(input_bam):
 
 
 def check_and_sort_bam(input_bam, sorted_bam_dir):
+    """
+    Ensure the input BAM is coordinate-sorted.
+
+    Reuses an up-to-date sorted BAM when available, copies the input if it is
+    already coordinate-sorted, or runs samtools sort to create a standardized
+    sorted BAM.
+    """
     sorted_bam_dir.mkdir(parents=True, exist_ok=True)
     output_bam = sorted_bam_dir / standardized_bam_name(input_bam)
 
@@ -119,6 +160,12 @@ def check_and_sort_bam(input_bam, sorted_bam_dir):
 
 
 def check_and_index_bam(sorted_bam, index_dir):
+    """
+    Ensure a sorted BAM has an up-to-date index.
+
+    Creates or reuses the adjacent .bai index, archives a copy in the project
+    index directory, and returns the adjacent index path.
+    """
     index_dir.mkdir(parents=True, exist_ok=True)
 
     adjacent_index = Path(f"{sorted_bam}.bai")
@@ -146,6 +193,12 @@ def check_and_index_bam(sorted_bam, index_dir):
 
 
 def run_modkit_pileup(sorted_bam, reference, output_prefix, bedgraph_dir, threads):
+    """
+    Run modkit pileup and create strand-specific bedGraphs.
+
+    Generates a full bedMethyl file, writes modkit logs, splits BrdU calls into
+    positive and negative strand bedGraphs, and returns the output paths.
+    """
     bedgraph_dir.mkdir(parents=True, exist_ok=True)
 
     bedmethyl = bedgraph_dir / f"{output_prefix}.full.bedmethyl"
@@ -180,6 +233,13 @@ def run_modkit_pileup(sorted_bam, reference, output_prefix, bedgraph_dir, thread
 
 
 def write_strand_bedgraphs(bedmethyl, positive_output, negative_output):
+    """
+    Split a bedMethyl file into positive and negative BrdU bedGraphs.
+
+    Keeps BrdU modification rows on + or - strands, calculates frac_mod as
+    Nmod / valid coverage, and writes chrom, start, end, frac_mod, Nmod, and
+    valid coverage columns.
+    """
     with open(bedmethyl, "r") as source, open(positive_output, "w") as pos, open(
         negative_output, "w"
     ) as neg:
@@ -217,6 +277,12 @@ def write_strand_bedgraphs(bedmethyl, positive_output, negative_output):
 
 
 def main():
+    """
+    Run the BAM-to-bedGraph workflow from command-line arguments.
+
+    Resolves inputs, sorts and indexes the BAM, runs modkit pileup, writes
+    strand-specific bedGraphs, and reports the generated output paths.
+    """
     args = parse_args()
     paths = project_paths()
 
