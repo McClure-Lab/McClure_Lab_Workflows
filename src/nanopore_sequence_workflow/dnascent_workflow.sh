@@ -57,16 +57,18 @@ usage() {
     echo
     echo "BAM and BAM index may be filenames in data/bam or explicit paths."
     echo "Reference FASTA may be a filename in data/fastq or an explicit path."
-    echo "DNAscent index and POD5 may be filenames in data/pod5 or explicit paths."
+    echo "DNAscent index may be a filename in data/pod5 or an explicit path."
+    echo "POD5 may be a single .pod5 file or a directory of .pod5 files."
+    echo "Relative POD5 inputs are resolved under data/pod5."
     echo
     echo "If arguments are omitted, the workflow prompts for them before submitting a SLURM job."
 }
 
-# Convert an existing file path into an absolute path.
+# Convert an existing file or directory path into an absolute path.
 #
-# The directory and filename are handled separately so the resulting
-# path points to the exact existing file.
-absolute_existing_file() {
+# The directory and basename are handled separately so the resulting
+# path points to the exact existing input.
+absolute_existing_path() {
     local path="$1"
     local dir
     local file
@@ -74,6 +76,10 @@ absolute_existing_file() {
     dir="$(cd "$(dirname "$path")" && pwd)"
     file="$(basename "$path")"
     printf '%s/%s\n' "$dir" "$file"
+}
+
+absolute_existing_file() {
+    absolute_existing_path "$1"
 }
 
 # Resolve an input filename or path.
@@ -134,9 +140,34 @@ resolve_reference_file() {
     resolve_file_in_dir "$1" "$FASTQ_DIR" "yes"
 }
 
-# Resolve a POD5 file from either an explicit path or data/pod5.
-resolve_pod5_file() {
-    resolve_file_in_dir "$1" "$POD5_DIR" "no"
+# Resolve a POD5 input from either an explicit path or data/pod5.
+resolve_pod5_path() {
+    local pod5_input="$1"
+    local pod5_path
+
+    if [[ -f "$pod5_input" || -d "$pod5_input" ]]; then
+        absolute_existing_path "$pod5_input"
+        return 0
+    fi
+
+    pod5_path="$POD5_DIR/$pod5_input"
+    if [[ -f "$pod5_path" || -d "$pod5_path" ]]; then
+        absolute_existing_path "$pod5_path"
+        return 0
+    fi
+
+    return 1
+}
+
+pod5_input_has_reads() {
+    local pod5_path="$1"
+
+    if [[ -f "$pod5_path" ]]; then
+        [[ "$pod5_path" == *.pod5 ]]
+        return
+    fi
+
+    find "$pod5_path" -maxdepth 1 -type f -name "*.pod5" -print -quit | grep -q .
 }
 
 # Resolve a DNAscent index from either an explicit path or data/pod5.
@@ -148,12 +179,17 @@ resolve_dnascent_index_file() {
 #
 # For example:
 # sample.sorted.indexed.bam becomes sample
+# sample.sorted.indexed_12345.bam becomes sample_12345
 derive_bam_prefix() {
     local bam_basename="$1"
     local prefix
 
     prefix="${bam_basename%.bam}"
-    prefix="${prefix%.sorted.indexed}"
+    if [[ "$prefix" =~ ^(.+)\.sorted\.indexed_([0-9]+)$ ]]; then
+        prefix="${BASH_REMATCH[1]}_${BASH_REMATCH[2]}"
+    else
+        prefix="${prefix%.sorted.indexed}"
+    fi
     printf '%s\n' "$prefix"
 }
 
@@ -245,6 +281,26 @@ container_runtime() {
     fi
 }
 
+# Add a directory to a Singularity/Apptainer bind array when it is not
+# already present. Binding each input directory lets DNAscent read files
+# supplied from outside the workflow root.
+add_container_bind_dir() {
+    local bind_dir="$1"
+    local existing_bind
+
+    if [[ -z "$bind_dir" || ! -d "$bind_dir" ]]; then
+        return
+    fi
+
+    for existing_bind in "${container_bind_dirs[@]}"; do
+        if [[ "$existing_bind" == "$bind_dir" ]]; then
+            return
+        fi
+    done
+
+    container_bind_dirs+=("$bind_dir")
+}
+
 # Run the compute-node portion of the workflow.
 #
 # This function is called after the script submits itself to SLURM
@@ -300,7 +356,6 @@ run_job() {
         "$bam_index" \
         "$reference" \
         "$dnascent_index" \
-        "$pod5_file" \
         "$dnascent_image"
     do
         if [[ ! -f "$required_file" ]]; then
@@ -308,6 +363,16 @@ run_job() {
             exit 1
         fi
     done
+
+    if [[ ! -f "$pod5_file" && ! -d "$pod5_file" ]]; then
+        echo "[ERROR] POD5 input not found: $pod5_file" >&2
+        exit 1
+    fi
+
+    if ! pod5_input_has_reads "$pod5_file"; then
+        echo "[ERROR] POD5 input must be a .pod5 file or a directory containing .pod5 files: $pod5_file" >&2
+        exit 1
+    fi
 
     # Prepare the required software environment.
     load_dnascent_modules
@@ -317,6 +382,9 @@ run_job() {
     local bam_prefix
     local output_bam
     local detect_log
+    local container_bind_dirs=()
+    local container_bind_args=()
+    local bind_dir
 
     # Select Singularity or Apptainer.
     runtime="$(container_runtime)"
@@ -326,8 +394,28 @@ run_job() {
     bam_prefix="$(derive_bam_prefix "$bam_basename")"
 
     # Construct the output BAM and DNAscent log filenames.
-    output_bam="$output_dir/${bam_prefix}.sorted.indexed.BrdU.detect.bam"
+    #
+    # Include the current SLURM job ID so repeated DNAscent runs on the
+    # same input BAM can keep distinct parameter-specific outputs.
+    output_bam="$output_dir/${bam_prefix}.sorted.indexed.BrdU.detect_${SLURM_JOB_ID:-manual}.bam"
     detect_log="$LOG_DIR/${bam_prefix}.${SLURM_JOB_ID:-manual}.dnascent.log"
+
+    add_container_bind_dir "$WORKFLOW_ROOT"
+    add_container_bind_dir "$(dirname "$bam_file")"
+    add_container_bind_dir "$(dirname "$bam_index")"
+    add_container_bind_dir "$(dirname "$reference")"
+    add_container_bind_dir "$(dirname "$dnascent_index")"
+    if [[ -d "$pod5_file" ]]; then
+        add_container_bind_dir "$pod5_file"
+    else
+        add_container_bind_dir "$(dirname "$pod5_file")"
+    fi
+    add_container_bind_dir "$output_dir"
+    add_container_bind_dir "$LOG_DIR"
+
+    for bind_dir in "${container_bind_dirs[@]}"; do
+        container_bind_args+=(--bind "$bind_dir:$bind_dir")
+    done
 
     # Write a complete summary of the run configuration to the DNAscent log.
     {
@@ -349,6 +437,7 @@ run_job() {
         echo "Min read length:  $min_read_length"
         echo "SLURM job ID:     ${SLURM_JOB_ID:-not_set}"
         echo "CUDA devices:     ${CUDA_VISIBLE_DEVICES:-not_set}"
+        echo "Container binds:  ${container_bind_dirs[*]}"
         echo "========================================="
     } > "$detect_log"
 
@@ -377,7 +466,7 @@ run_job() {
     #   Makes NVIDIA GPU libraries and devices available inside the container.
     #
     # --bind:
-    #   Makes the workflow directory available at the same path inside the container.
+    #   Makes input and output directories available at the same paths inside the container.
     #
     # detect:
     #   Runs DNAscent's BrdU detection command.
@@ -408,7 +497,7 @@ run_job() {
     local dnascent_args=(
         run
         --nv
-        --bind "$WORKFLOW_ROOT:$WORKFLOW_ROOT"
+        "${container_bind_args[@]}"
         "$dnascent_image"
         detect
         -t "$threads"
@@ -540,13 +629,14 @@ submit_workflow() {
         read -r -p "Enter DNAscent index filename from data/pod5 or an explicit path: " dnascent_index_input
     fi
 
-    # Display available POD5 files and prompt for the raw signal file
+    # Display available POD5 files/directories and prompt for the raw signal input
     # when one was not supplied as an argument.
     if [[ -z "$pod5_input" ]]; then
-        echo "[INFO] Available POD5 files in $POD5_DIR:"
+        echo "[INFO] Available POD5 files and directories in $POD5_DIR:"
         find "$POD5_DIR" -maxdepth 1 -type f -name "*.pod5" -printf "  %f\n" | sort
+        find "$POD5_DIR" -mindepth 1 -maxdepth 1 -type d -printf "  %f/\n" | sort
         echo
-        read -r -p "Enter POD5 filename from data/pod5 or an explicit path: " pod5_input
+        read -r -p "Enter POD5 file/directory from data/pod5 or an explicit path: " pod5_input
     fi
 
     # Confirm that all required input values were provided.
@@ -576,10 +666,15 @@ submit_workflow() {
         exit 1
     fi
 
-    # Resolve the POD5 file to an absolute existing path.
-    if ! pod5_file="$(resolve_pod5_file "$pod5_input")"; then
-        echo "[ERROR] POD5 file not found: $pod5_input"
-        echo "[ERROR] Expected a valid path or a filename in $POD5_DIR"
+    # Resolve the POD5 input to an absolute existing file or directory path.
+    if ! pod5_file="$(resolve_pod5_path "$pod5_input")"; then
+        echo "[ERROR] POD5 input not found: $pod5_input"
+        echo "[ERROR] Expected a valid .pod5 file/directory or a name in $POD5_DIR"
+        exit 1
+    fi
+
+    if ! pod5_input_has_reads "$pod5_file"; then
+        echo "[ERROR] POD5 input must be a .pod5 file or a directory containing .pod5 files: $pod5_file"
         exit 1
     fi
 
@@ -624,7 +719,7 @@ submit_workflow() {
     echo "[INFO] Reference: $reference"
     echo "[INFO] DNAscent index: $dnascent_index"
     echo "[INFO] POD5: $pod5_file"
-    echo "[INFO] Expected output BAM: $output_dir/${bam_prefix}.sorted.indexed.BrdU.detect.bam"
+    echo "[INFO] Expected output BAM: $output_dir/${bam_prefix}.sorted.indexed.BrdU.detect_<jobid>.bam"
     echo
     echo "Submitting DNAscent workflow to SLURM..."
 
@@ -681,7 +776,7 @@ submit_workflow() {
 
     # Display the submitted job ID and all expected output/log locations.
     echo "[INFO] Submitted SLURM job: $job_id"
-    echo "[INFO] Expected BAM:  $output_dir/${bam_prefix}.sorted.indexed.BrdU.detect.bam"
+    echo "[INFO] Expected BAM:  $output_dir/${bam_prefix}.sorted.indexed.BrdU.detect_${log_job_id}.bam"
     echo "[INFO] SLURM log:     $LOG_DIR/${bam_prefix}.${log_job_id}.slurm.log"
     echo "[INFO] SLURM err:     $LOG_DIR/${bam_prefix}.${log_job_id}.slurm.err"
     echo "[INFO] DNAscent log:  $LOG_DIR/${bam_prefix}.${log_job_id}.dnascent.log"

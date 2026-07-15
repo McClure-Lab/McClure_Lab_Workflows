@@ -219,18 +219,30 @@ mkdir -p "$OUTPUT_DIR" "$(dirname "$LOG_FILE")"
 FASTQ_BASENAME="$(basename "$FASTQ")"
 FASTQ_PREFIX="${FASTQ_BASENAME%.fastq}"
 FASTQ_PREFIX="${FASTQ_PREFIX%.fq}"
+JOB_ID="${SLURM_JOB_ID:-manual}"
+
+# FASTQs produced by dorado_basecall.sh are named sample_jobid.fastq.
+# Reuse that job ID when present; otherwise use the current job ID.
+SAMPLE_PREFIX="$FASTQ_PREFIX"
+OUTPUT_JOB_ID="$JOB_ID"
+if [[ "$FASTQ_PREFIX" == *_"$JOB_ID" ]]; then
+    SAMPLE_PREFIX="${FASTQ_PREFIX%_"$JOB_ID"}"
+elif [[ "$FASTQ_PREFIX" =~ ^(.+)_([0-9]+)$ ]]; then
+    SAMPLE_PREFIX="${BASH_REMATCH[1]}"
+    OUTPUT_JOB_ID="${BASH_REMATCH[2]}"
+fi
 
 # Define the raw unsorted BAM output.
-RAW_BAM="$OUTPUT_DIR/${FASTQ_PREFIX}.bam"
+RAW_BAM="$OUTPUT_DIR/${SAMPLE_PREFIX}_${OUTPUT_JOB_ID}.bam"
 
 # Define the final sorted and indexed BAM output.
-SORTED_INDEXED_BAM="$OUTPUT_DIR/${FASTQ_PREFIX}.sorted.indexed.bam"
+SORTED_INDEXED_BAM="$OUTPUT_DIR/${SAMPLE_PREFIX}.sorted.indexed_${OUTPUT_JOB_ID}.bam"
 
 # Store the final BAM path in a general variable used throughout QC.
 BAM_FILE="$SORTED_INDEXED_BAM"
 
 # Define the separate alignment QC report.
-QC_REPORT="$OUTPUT_DIR/${FASTQ_PREFIX}.alignment_qc.txt"
+QC_REPORT="$OUTPUT_DIR/${SAMPLE_PREFIX}_${OUTPUT_JOB_ID}.alignment_qc.txt"
 
 # Construct the optional Minimap2 flag that disables secondary alignments.
 #
@@ -290,6 +302,7 @@ fi
     echo "Min read length: $MIN_READ_LENGTH"
     echo "Primary only:    $PRIMARY_ONLY"
     echo "SLURM job ID:    ${SLURM_JOB_ID:-not_set}"
+    echo "Output job ID:   $OUTPUT_JOB_ID"
     echo "========================================="
 } > "$LOG_FILE"
 
@@ -297,7 +310,8 @@ fi
 echo "=========================================" > "$QC_REPORT"
 echo "  ALIGNMENT QC REPORT" >> "$QC_REPORT"
 echo "  $(date)" >> "$QC_REPORT"
-echo "  Sample: $FASTQ_PREFIX" >> "$QC_REPORT"
+echo "  Sample: $SAMPLE_PREFIX" >> "$QC_REPORT"
+echo "  Job ID: $OUTPUT_JOB_ID" >> "$QC_REPORT"
 echo "=========================================" >> "$QC_REPORT"
 
 # Build the Minimap2 command as a Bash array.

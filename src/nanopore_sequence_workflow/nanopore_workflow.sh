@@ -51,7 +51,8 @@ DEFAULT_BAM_DIR="$WORKFLOW_ROOT/data/bam"
 usage() {
     echo "Usage: bash src/nanopore_sequence_workflow/nanopore_workflow.sh [POD5] [REFERENCE_FASTA] [FASTQ_OUTPUT_DIR] [BAM_OUTPUT_DIR]"
     echo
-    echo "POD5 may be a filename in data/pod5 or an explicit path."
+    echo "POD5 may be a single .pod5 file or a directory of .pod5 files."
+    echo "Relative POD5 inputs are resolved under data/pod5."
     echo "FASTQ and BAM outputs default to data/fastq and data/bam."
     echo
     echo "If arguments are omitted, the workflow prompts for them before submitting a SLURM job."
@@ -75,8 +76,8 @@ resolve_data_output_dir() {
     fi
 }
 
-# Convert an existing file path into an absolute path.
-absolute_existing_file() {
+# Convert an existing file or directory path into an absolute path.
+absolute_existing_path() {
     local path="$1"
     local dir
     local file
@@ -86,26 +87,41 @@ absolute_existing_file() {
     printf '%s/%s\n' "$dir" "$file"
 }
 
+absolute_existing_file() {
+    absolute_existing_path "$1"
+}
+
 # Resolve the POD5 input.
 #
 # The function first checks the input exactly as entered.
 # If it is not found, it checks data/pod5.
-resolve_pod5_file() {
+resolve_pod5_path() {
     local pod5_input="$1"
     local pod5_path
 
-    if [[ -f "$pod5_input" ]]; then
-        absolute_existing_file "$pod5_input"
+    if [[ -f "$pod5_input" || -d "$pod5_input" ]]; then
+        absolute_existing_path "$pod5_input"
         return 0
     fi
 
     pod5_path="$POD5_DIR/$pod5_input"
-    if [[ -f "$pod5_path" ]]; then
-        absolute_existing_file "$pod5_path"
+    if [[ -f "$pod5_path" || -d "$pod5_path" ]]; then
+        absolute_existing_path "$pod5_path"
         return 0
     fi
 
     return 1
+}
+
+pod5_input_has_reads() {
+    local pod5_path="$1"
+
+    if [[ -f "$pod5_path" ]]; then
+        [[ "$pod5_path" == *.pod5 ]]
+        return
+    fi
+
+    find "$pod5_path" -maxdepth 1 -type f -name "*.pod5" -print -quit | grep -q .
 }
 
 # Resolve the reference FASTA path.
@@ -307,7 +323,7 @@ run_job() {
     local fastq_file
     local bam_file
 
-    # Derive the sample name from the POD5 filename.
+    # Derive the sample name from the POD5 file or directory name.
     #
     # Example:
     # sample.pod5 becomes sample
@@ -399,12 +415,13 @@ submit_workflow() {
     mkdir -p "$LOG_DIR" "$POD5_DIR" "$DEFAULT_FASTQ_DIR" "$DEFAULT_BAM_DIR"
 
     # When no POD5 was provided as a positional argument, display the
-    # available POD5 files and prompt the user to select one.
+    # available POD5 files/directories and prompt the user to select one.
     if [[ -z "$pod5_input" ]]; then
-        echo "[INFO] Available POD5 files in $POD5_DIR:"
+        echo "[INFO] Available POD5 files and directories in $POD5_DIR:"
         find "$POD5_DIR" -maxdepth 1 -type f -name "*.pod5" -printf "  %f\n" | sort
+        find "$POD5_DIR" -mindepth 1 -maxdepth 1 -type d -printf "  %f/\n" | sort
         echo
-        read -r -p "Enter POD5 filename from data/pod5 or an explicit path: " pod5_input
+        read -r -p "Enter POD5 file/directory from data/pod5 or an explicit path: " pod5_input
     fi
 
     # Prompt for the reference FASTA when it was not supplied.
@@ -428,10 +445,15 @@ submit_workflow() {
         exit 1
     fi
 
-    # Resolve the POD5 input to an absolute existing path.
-    if ! pod5="$(resolve_pod5_file "$pod5_input")"; then
-        echo "[ERROR] POD5 file not found: $pod5_input"
-        echo "[ERROR] Expected a valid path or a filename in $POD5_DIR"
+    # Resolve the POD5 input to an absolute existing file or directory path.
+    if ! pod5="$(resolve_pod5_path "$pod5_input")"; then
+        echo "[ERROR] POD5 input not found: $pod5_input"
+        echo "[ERROR] Expected a valid .pod5 file/directory or a name in $POD5_DIR"
+        exit 1
+    fi
+
+    if ! pod5_input_has_reads "$pod5"; then
+        echo "[ERROR] POD5 input must be a .pod5 file or a directory containing .pod5 files: $pod5"
         exit 1
     fi
 
@@ -450,7 +472,7 @@ submit_workflow() {
     validate_data_output_dir "FASTQ output directory" "$fastq_output_dir"
     validate_data_output_dir "BAM output directory" "$bam_output_dir"
 
-    # Derive the sample prefix from the POD5 filename.
+    # Derive the sample prefix from the POD5 file or directory name.
     pod5_basename="$(basename "$pod5")"
     pod5_prefix="${pod5_basename%.pod5}"
 
@@ -616,8 +638,9 @@ submit_workflow() {
 
     # Display the submitted job and all expected output/log paths.
     echo "[INFO] Submitted SLURM job: $job_id"
-    echo "[INFO] Expected FASTQ: $fastq_output_dir/${pod5_prefix}.fastq"
-    echo "[INFO] Expected BAM:   $bam_output_dir/${pod5_prefix}.sorted.indexed.bam"
+    echo "[INFO] Expected FASTQ: $fastq_output_dir/${pod5_prefix}_${log_job_id}.fastq"
+    echo "[INFO] Expected raw BAM: $bam_output_dir/${pod5_prefix}_${log_job_id}.bam"
+    echo "[INFO] Expected sorted indexed BAM: $bam_output_dir/${pod5_prefix}.sorted.indexed_${log_job_id}.bam"
     echo "[INFO] SLURM log:      $LOG_DIR/${pod5_prefix}.${log_job_id}.slurm.log"
     echo "[INFO] SLURM err:      $LOG_DIR/${pod5_prefix}.${log_job_id}.slurm.err"
     echo "[INFO] Dorado log:     $LOG_DIR/${pod5_prefix}.${log_job_id}.dorado.log"

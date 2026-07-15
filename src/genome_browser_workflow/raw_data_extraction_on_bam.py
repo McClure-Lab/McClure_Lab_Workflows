@@ -8,8 +8,6 @@ columns:
 """
 
 import argparse
-import os
-import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -49,6 +47,19 @@ def parse_args():
         help="Threads passed to modkit pileup.",
     )
     parser.add_argument(
+        "--mod-threshold",
+        default="B:0.5",
+        help="Modification threshold passed to modkit pileup.",
+    )
+    parser.add_argument(
+        "--filter-threshold",
+        default="0.0",
+        help=(
+            "Global filter threshold passed to modkit pileup. Defaults to 0.0 "
+            "to prevent modkit from estimating its default filtering threshold."
+        ),
+    )
+    parser.add_argument(
         "--bedgraph-dir",
         default=None,
         help="Output directory for generated bedgraph files.",
@@ -76,7 +87,6 @@ def project_paths():
     return {
         "bam_dir": root / "data" / "bam",
         "sorted_bam_dir": root / "data" / "sorted_bam",
-        "index_dir": root / "data" / "index_sorted_bam_bai",
         "bedgraph_dir": root / "data" / "bedgraph",
     }
 
@@ -111,65 +121,71 @@ def strip_bam_suffix(path):
     return name[:-4] if name.endswith(".bam") else Path(name).stem
 
 
-def standardized_bam_name(input_bam):
+def prepared_bam_name(input_bam):
     """
-    Create the standardized sorted/indexed BAM filename.
+    Return the canonical prepared BAM name for this workflow.
 
-    Removes existing .sorted or .sorted.indexed suffixes from the input basename
-    and returns a name ending in .sorted.indexed.bam.
+    The prepared BAM is always named as sorted, indexed, and BrdU-detected so it
+    is clear which file should be passed to modkit pileup.
     """
     base = strip_bam_suffix(input_bam)
+    known_suffixes = (
+        ".sorted.indexed.BrdU.detect",
+        ".BrdU.detect.sorted.indexed",
+        ".sorted.indexed",
+        ".BrdU.detect",
+        ".sorted",
+    )
 
-    if base.endswith(".sorted.indexed"):
-        base = base[: -len(".sorted.indexed")]
-    elif base.endswith(".sorted"):
-        base = base[: -len(".sorted")]
+    changed = True
+    while changed:
+        changed = False
+        for suffix in known_suffixes:
+            if base.endswith(suffix):
+                base = base[: -len(suffix)]
+                changed = True
+                break
 
-    return f"{base}.sorted.indexed.bam"
+    return f"{base}.sorted.indexed.BrdU.detect.bam"
 
 
 def check_and_sort_bam(input_bam, sorted_bam_dir):
     """
-    Ensure the input BAM is coordinate-sorted.
+    Create or reuse the workflow's prepared coordinate-sorted BAM.
 
-    Reuses an up-to-date sorted BAM when available, copies the input if it is
-    already coordinate-sorted, or runs samtools sort to create a standardized
-    sorted BAM.
+    The BAM header's sort-order flag is not trusted here because an incorrectly
+    marked BAM will still fail indexing. A prepared BAM is reused only when both
+    the BAM and adjacent index are newer than the source BAM.
     """
     sorted_bam_dir.mkdir(parents=True, exist_ok=True)
-    output_bam = sorted_bam_dir / standardized_bam_name(input_bam)
+    output_bam = sorted_bam_dir / prepared_bam_name(input_bam)
+    output_index = Path(f"{output_bam}.bai")
 
-    if output_bam.exists() and output_bam.stat().st_mtime >= input_bam.stat().st_mtime:
-        print(f"[INFO] Reusing sorted BAM: {output_bam}", file=sys.stderr)
+    if (
+        output_bam.exists()
+        and output_index.exists()
+        and output_bam.stat().st_mtime >= input_bam.stat().st_mtime
+        and output_index.stat().st_mtime >= output_bam.stat().st_mtime
+    ):
+        print(f"[INFO] Reusing prepared BAM: {output_bam}", file=sys.stderr)
         return output_bam
 
-    with pysam.AlignmentFile(str(input_bam), "rb", check_sq=False) as bam:
-        sort_order = bam.header.to_dict().get("HD", {}).get("SO", "unknown")
-
-    if sort_order == "coordinate":
-        print(f"[INFO] Copying coordinate-sorted BAM to {output_bam}", file=sys.stderr)
-        shutil.copy2(input_bam, output_bam)
-    else:
-        print(f"[INFO] Sorting BAM with samtools: {output_bam}", file=sys.stderr)
-        subprocess.run(
-            ["samtools", "sort", "-o", str(output_bam), str(input_bam)],
-            check=True,
-        )
+    print(f"[INFO] Sorting BAM with samtools: {output_bam}", file=sys.stderr)
+    subprocess.run(
+        ["samtools", "sort", "-o", str(output_bam), str(input_bam)],
+        check=True,
+    )
 
     return output_bam
 
 
-def check_and_index_bam(sorted_bam, index_dir):
+def check_and_index_bam(sorted_bam):
     """
     Ensure a sorted BAM has an up-to-date index.
 
-    Creates or reuses the adjacent .bai index, archives a copy in the project
-    index directory, and returns the adjacent index path.
+    Creates or reuses the adjacent .bai index and returns its path.
     """
-    index_dir.mkdir(parents=True, exist_ok=True)
-
     adjacent_index = Path(f"{sorted_bam}.bai")
-    archived_index = index_dir / f"{sorted_bam.name}.bai"
 
     needs_index = (
         not adjacent_index.exists()
@@ -182,17 +198,134 @@ def check_and_index_bam(sorted_bam, index_dir):
     else:
         print(f"[INFO] Reusing adjacent BAM index: {adjacent_index}", file=sys.stderr)
 
-    if (
-        not archived_index.exists()
-        or archived_index.stat().st_mtime < adjacent_index.stat().st_mtime
-    ):
-        shutil.copy2(adjacent_index, archived_index)
-        print(f"[INFO] Archived BAM index: {archived_index}", file=sys.stderr)
-
     return adjacent_index
 
 
-def run_modkit_pileup(sorted_bam, reference, output_prefix, bedgraph_dir, threads):
+def normalize_mod_code(mod_code):
+    """
+    Return a readable modified-base code from pysam's modified_bases key.
+    """
+    if isinstance(mod_code, int):
+        try:
+            return chr(mod_code)
+        except ValueError:
+            return str(mod_code)
+
+    return str(mod_code)
+
+
+def summarize_modified_base_tags(bam_path, sample_limit=50000):
+    """
+    Inspect a BAM sample for modified-base tags expected by modkit.
+
+    modkit reads modified-base calls from MM/ML SAM tags. This workflow then
+    keeps BrdU calls with modification code "b".
+    """
+    summary = {
+        "reads_checked": 0,
+        "reads_with_mm": 0,
+        "reads_with_ml": 0,
+        "reads_with_mod_calls": 0,
+        "reads_with_brdu": 0,
+        "mod_codes": {},
+        "parse_errors": 0,
+    }
+
+    with pysam.AlignmentFile(str(bam_path), "rb", check_sq=False) as bam:
+        for read in bam.fetch(until_eof=True):
+            if read.is_unmapped or read.is_secondary or read.is_supplementary:
+                continue
+
+            summary["reads_checked"] += 1
+
+            if read.has_tag("MM"):
+                summary["reads_with_mm"] += 1
+            if read.has_tag("ML"):
+                summary["reads_with_ml"] += 1
+
+            try:
+                modified_bases = read.modified_bases or {}
+            except ValueError:
+                summary["parse_errors"] += 1
+                modified_bases = {}
+
+            if modified_bases:
+                summary["reads_with_mod_calls"] += 1
+
+            read_has_brdu = False
+            for (_, _, mod_code), mod_list in modified_bases.items():
+                code = normalize_mod_code(mod_code)
+                summary["mod_codes"][code] = summary["mod_codes"].get(code, 0) + len(
+                    mod_list
+                )
+                if code == "b":
+                    read_has_brdu = True
+
+            if read_has_brdu:
+                summary["reads_with_brdu"] += 1
+
+            if summary["reads_checked"] >= sample_limit:
+                break
+
+    return summary
+
+
+def validate_brdu_mod_tags(bam_path):
+    """
+    Fail early when the BAM does not appear to contain BrdU modBAM calls.
+    """
+    summary = summarize_modified_base_tags(bam_path)
+    codes = ", ".join(
+        f"{code}:{count}" for code, count in sorted(summary["mod_codes"].items())
+    )
+    codes = codes or "none"
+
+    print(
+        "[INFO] BAM modified-base preflight: "
+        f"checked {summary['reads_checked']} primary mapped reads; "
+        f"MM tags in {summary['reads_with_mm']}; "
+        f"ML tags in {summary['reads_with_ml']}; "
+        f"modified-base calls in {summary['reads_with_mod_calls']}; "
+        f"BrdU code b in {summary['reads_with_brdu']}; "
+        f"codes observed: {codes}",
+        file=sys.stderr,
+    )
+
+    if summary["parse_errors"]:
+        print(
+            "[WARN] Some reads had modified-base tags that pysam could not parse: "
+            f"{summary['parse_errors']}",
+            file=sys.stderr,
+        )
+
+    if summary["reads_checked"] == 0:
+        raise ValueError("No primary mapped reads were found in the BAM.")
+
+    if summary["reads_with_mm"] == 0 or summary["reads_with_ml"] == 0:
+        raise ValueError(
+            "No MM/ML modified-base tags were found in the sampled reads. "
+            "modkit pileup requires a modBAM with modified-base calls; a normal "
+            "aligned BAM can be large and still produce 0 modkit rows."
+        )
+
+    if summary["reads_with_brdu"] == 0:
+        raise ValueError(
+            'No BrdU modification code "b" was found in the sampled reads. '
+            "This genome browser workflow only plots BrdU calls encoded as "
+            '"b"; run it on the DNAscent/Dorado BrdU-detected modBAM or check '
+            "which modification codes are present."
+        )
+
+
+def run_modkit_pileup(
+    sorted_bam,
+    reference,
+    output_prefix,
+    bedgraph_dir,
+    threads,
+    mod_threshold,
+    filter_threshold,
+):
     """
     Run modkit pileup and create strand-specific bedGraphs.
 
@@ -219,6 +352,10 @@ def run_modkit_pileup(sorted_bam, reference, output_prefix, bedgraph_dir, thread
         str(reference),
         "--threads",
         str(threads),
+        "--mod-threshold",
+        mod_threshold,
+        "--filter-threshold",
+        filter_threshold,
         "--only-tabs",
         "--log-filepath",
         str(log_path),
@@ -302,7 +439,13 @@ def main():
     output_prefix = args.output_prefix or strip_bam_suffix(input_bam)
 
     sorted_bam = check_and_sort_bam(input_bam, paths["sorted_bam_dir"])
-    check_and_index_bam(sorted_bam, paths["index_dir"])
+    check_and_index_bam(sorted_bam)
+
+    try:
+        validate_brdu_mod_tags(sorted_bam)
+    except ValueError as error:
+        print(f"[ERROR] {error}", file=sys.stderr)
+        sys.exit(1)
 
     positive, negative, bedmethyl = run_modkit_pileup(
         sorted_bam=sorted_bam,
@@ -310,6 +453,8 @@ def main():
         output_prefix=output_prefix,
         bedgraph_dir=bedgraph_dir,
         threads=args.threads,
+        mod_threshold=args.mod_threshold,
+        filter_threshold=args.filter_threshold,
     )
 
     print(f"[INFO] Bedmethyl written to {bedmethyl}", file=sys.stderr)

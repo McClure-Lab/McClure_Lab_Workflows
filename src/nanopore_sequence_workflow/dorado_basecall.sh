@@ -8,7 +8,7 @@ set -euo pipefail
 
 # Display the expected command-line arguments for this script.
 usage() {
-    echo "Usage: bash src/nanopore_sequence_workflow/dorado_basecall.sh --pod5 POD5 --output-dir DIR --log-file LOG --model MODEL --device DEVICE --min-qscore N [--kit-name KIT] [--barcode-mode none|demux] [--modified-bases MODEL_OR_CODE]"
+    echo "Usage: bash src/nanopore_sequence_workflow/dorado_basecall.sh --pod5 POD5_FILE_OR_DIR --output-dir DIR --log-file LOG --model MODEL --device DEVICE --min-qscore N [--kit-name KIT] [--barcode-mode none|demux] [--modified-bases MODEL_OR_CODE]"
 }
 
 # Initialize all input variables.
@@ -132,9 +132,19 @@ if [[ -z "$POD5" || -z "$OUTPUT_DIR" || -z "$LOG_FILE" ]]; then
     exit 1
 fi
 
-# Confirm that the input POD5 file exists.
-if [[ ! -f "$POD5" ]]; then
-    echo "[ERROR] POD5 file not found: $POD5"
+# Confirm that the input POD5 file or directory exists.
+if [[ ! -f "$POD5" && ! -d "$POD5" ]]; then
+    echo "[ERROR] POD5 input not found: $POD5"
+    exit 1
+fi
+
+if [[ -f "$POD5" && "$POD5" != *.pod5 ]]; then
+    echo "[ERROR] POD5 input file must end in .pod5: $POD5"
+    exit 1
+fi
+
+if [[ -d "$POD5" ]] && ! find "$POD5" -maxdepth 1 -type f -name "*.pod5" -print -quit | grep -q .; then
+    echo "[ERROR] POD5 directory contains no .pod5 files: $POD5"
     exit 1
 fi
 
@@ -161,18 +171,23 @@ fi
 # containing the log file if they do not already exist.
 mkdir -p "$OUTPUT_DIR" "$(dirname "$LOG_FILE")"
 
-# Derive the sample name from the input POD5 filename.
+# Derive the sample name from the input POD5 file or directory name.
 #
 # Example:
 # sample.pod5 becomes sample
+# sample_pod5_dir becomes sample_pod5_dir
 POD5_BASENAME="$(basename "$POD5")"
 POD5_PREFIX="${POD5_BASENAME%.pod5}"
+JOB_ID="${SLURM_JOB_ID:-manual}"
 
 # Construct the main FASTQ output path.
-FASTQ_FILE="$OUTPUT_DIR/${POD5_PREFIX}.fastq"
+#
+# Include the SLURM job ID so repeated runs on the same POD5 input
+# do not overwrite one another when parameters differ.
+FASTQ_FILE="$OUTPUT_DIR/${POD5_PREFIX}_${JOB_ID}.fastq"
 
 # Construct the directory used for barcode-separated FASTQ files.
-BARCODE_DIR="$OUTPUT_DIR/${POD5_PREFIX}_barcodes"
+BARCODE_DIR="$OUTPUT_DIR/${POD5_PREFIX}_${JOB_ID}_barcodes"
 
 # Write the basecalling configuration to the log file.
 #
@@ -306,7 +321,7 @@ if [[ "$BARCODE_MODE" == "demux" ]]; then
         >> "$LOG_FILE" 2>&1
 
     # Rename Dorado's barcode FASTQ outputs so every filename begins
-    # with the original POD5 sample prefix.
+    # with the original POD5 sample prefix and job ID.
     for file in "$BARCODE_DIR"/*.fastq; do
         # Skip the loop when no FASTQ files matched the wildcard.
         [[ -e "$file" ]] || continue
@@ -316,13 +331,13 @@ if [[ "$BARCODE_MODE" == "demux" ]]; then
         # Rename classified barcode files.
         #
         # Example:
-        # barcode01.fastq becomes sample_barcode01.fastq
+        # barcode01.fastq becomes sample_jobid_barcode01.fastq
         if [[ "$basename_file" =~ (barcode[0-9]+) ]]; then
-            mv "$file" "$BARCODE_DIR/${POD5_PREFIX}_${BASH_REMATCH[1]}.fastq"
+            mv "$file" "$BARCODE_DIR/${POD5_PREFIX}_${JOB_ID}_${BASH_REMATCH[1]}.fastq"
 
         # Rename reads that could not be assigned to a barcode.
         elif [[ "$basename_file" == *unclassified* ]]; then
-            mv "$file" "$BARCODE_DIR/${POD5_PREFIX}_unclassified.fastq"
+            mv "$file" "$BARCODE_DIR/${POD5_PREFIX}_${JOB_ID}_unclassified.fastq"
         fi
     done
 fi

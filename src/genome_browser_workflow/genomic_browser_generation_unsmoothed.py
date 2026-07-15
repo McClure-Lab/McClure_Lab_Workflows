@@ -37,6 +37,7 @@ def main():
         trna_bed=args.trna_bed,
         te_bed=args.te_bed,
         smoothed=False,
+        phase_label=args.phase_label,
     )
 
 

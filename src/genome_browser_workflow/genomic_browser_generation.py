@@ -132,6 +132,12 @@ def add_common_args(parser):
         help="Prefix included in generated PNG filenames.",
     )
     parser.add_argument(
+        "--phase-label",
+        choices=["Mitosis", "S Phase"],
+        default=None,
+        help="Cell-cycle phase label shown at the start of each plot title.",
+    )
+    parser.add_argument(
         "--g4-bed",
         default=str(bed_dir / "W303_g4_motifs.bed"),
         help="G4 motif BED file.",
@@ -173,6 +179,9 @@ def map_chromosome(chrom_id: str) -> Optional[str]:
 
 
 def chrom_sort_key(value):
+    """
+    Return a sort key that places numeric chromosomes before other values.
+    """
     value = str(value)
     if value.isdigit():
         return 0, int(value)
@@ -601,7 +610,15 @@ def downsampled_main_signal(chrom_df, chr_length, smoothed):
     return centers, coverage_binned, brdu_binned, "step"
 
 
-def plot_chromosome(chrom, chrom_df, features_by_chrom, output_dir, prefix, smoothed):
+def plot_chromosome(
+    chrom,
+    chrom_df,
+    features_by_chrom,
+    output_dir,
+    prefix,
+    smoothed,
+    phase_label=None,
+):
     """
     Plot coverage, BrdU signal, and genomic feature tracks for one chromosome.
 
@@ -611,6 +628,7 @@ def plot_chromosome(chrom, chrom_df, features_by_chrom, output_dir, prefix, smoo
     """
     chr_length = int(CHROM_LENGTHS.get(chrom, chrom_df["end"].max()))
     mode_label = "smoothed" if smoothed else "unsmoothed"
+    title_prefix = f"{phase_label} " if phase_label else ""
 
     fig = plt.figure(figsize=(15, 7))
     gs = fig.add_gridspec(3, 1, height_ratios=[3.5, 0.40, 2.5], hspace=0.15)
@@ -660,7 +678,10 @@ def plot_chromosome(chrom, chrom_df, features_by_chrom, output_dir, prefix, smoo
     ax.set_xlim(0, chr_length)
     ax.set_ylabel("Read count")
     ax.set_xlabel("Genomic position (bp)")
-    ax.set_title(f"BrdU pileup along chromosome {chrom} ({mode_label}; subtelomeres highlighted)")
+    ax.set_title(
+        f"{title_prefix}BrdU pileup along chromosome {chrom} "
+        f"({mode_label}; subtelomeres highlighted)"
+    )
     ax.xaxis.set_major_formatter(ScalarFormatter(useOffset=False))
     ax.ticklabel_format(style="plain", axis="x")
     ax.grid(True, axis="x", alpha=0.15)
@@ -714,6 +735,7 @@ def generate_genome_browser(
     te_bed=None,
     smoothed=True,
     window=1000,
+    phase_label=None,
 ):
     """
     Generate genome browser plots for all chromosomes in the input bedGraphs.
@@ -751,6 +773,7 @@ def generate_genome_browser(
                 output_dir=output_dir,
                 prefix=prefix,
                 smoothed=smoothed,
+                phase_label=phase_label,
             )
         )
 
@@ -773,6 +796,7 @@ def main():
         te_bed=args.te_bed,
         smoothed=True,
         window=args.window,
+        phase_label=args.phase_label,
     )
 
 
