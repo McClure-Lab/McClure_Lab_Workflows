@@ -8,7 +8,7 @@ set -euo pipefail
 
 # Display the expected command-line arguments for this script.
 usage() {
-    echo "Usage: bash src/nanopore_sequence_workflow/dorado_basecall.sh --pod5 POD5_FILE_OR_DIR --output-dir DIR --log-file LOG --model MODEL --device DEVICE --min-qscore N [--kit-name KIT] [--barcode-mode none|demux] [--modified-bases MODEL_OR_CODE]"
+    echo "Usage: bash src/nanopore_sequence_workflow/dorado_basecall.sh --pod5 POD5_FILE_OR_DIR --output-dir DIR --log-file LOG --model MODEL --device DEVICE --min-qscore N [--output-format fastq|bam] [--reference FASTA] [--emit-moves yes|no] [--mm2-opts OPTS] [--kit-name KIT] [--barcode-mode none|demux] [--modified-bases MODEL_OR_CODE]"
 }
 
 # Initialize all input variables.
@@ -25,6 +25,10 @@ LOG_FILE=""
 DORADO_MODEL=""
 DEVICE=""
 MIN_QSCORE=""
+OUTPUT_FORMAT="fastq"
+REFERENCE=""
+EMIT_MOVES="yes"
+MM2_OPTS=""
 KIT_NAME=""
 BARCODE_MODE="none"
 MODIFIED_BASES=""
@@ -67,6 +71,30 @@ while [[ $# -gt 0 ]]; do
         # Minimum read quality score required for reads to be emitted.
         --min-qscore)
             MIN_QSCORE="$2"
+            shift 2
+            ;;
+
+        # Select whether Dorado writes FASTQ or aligned BAM output.
+        --output-format)
+            OUTPUT_FORMAT="$2"
+            shift 2
+            ;;
+
+        # Reference FASTA used when Dorado produces aligned BAM output.
+        --reference|--ref)
+            REFERENCE="$2"
+            shift 2
+            ;;
+
+        # Controls whether Dorado writes move-table information to BAM.
+        --emit-moves)
+            EMIT_MOVES="$2"
+            shift 2
+            ;;
+
+        # Optional minimap2 option string passed through Dorado alignment.
+        --mm2-opts)
+            MM2_OPTS="$2"
             shift 2
             ;;
 
@@ -123,6 +151,8 @@ done
 DORADO_MODEL="${DORADO_MODEL:-sup}"
 DEVICE="${DEVICE:-cuda:0}"
 MIN_QSCORE="${MIN_QSCORE:-6}"
+OUTPUT_FORMAT="${OUTPUT_FORMAT:-fastq}"
+EMIT_MOVES="${EMIT_MOVES:-yes}"
 BARCODE_MODE="${BARCODE_MODE:-none}"
 
 # Confirm that the required arguments were provided.
@@ -135,6 +165,34 @@ fi
 # Confirm that the input POD5 file or directory exists.
 if [[ ! -f "$POD5" && ! -d "$POD5" ]]; then
     echo "[ERROR] POD5 input not found: $POD5"
+    exit 1
+fi
+
+case "$OUTPUT_FORMAT" in
+    fastq|bam) ;;
+    *)
+        echo "[ERROR] Invalid output format: $OUTPUT_FORMAT"
+        echo "[ERROR] Expected fastq or bam."
+        exit 1
+        ;;
+esac
+
+case "$EMIT_MOVES" in
+    yes|no) ;;
+    *)
+        echo "[ERROR] Invalid --emit-moves value: $EMIT_MOVES"
+        echo "[ERROR] Expected yes or no."
+        exit 1
+        ;;
+esac
+
+if [[ "$OUTPUT_FORMAT" == "bam" && -z "$REFERENCE" ]]; then
+    echo "[ERROR] --reference is required when --output-format bam is used."
+    exit 1
+fi
+
+if [[ -n "$REFERENCE" && ! -f "$REFERENCE" ]]; then
+    echo "[ERROR] Reference FASTA not found: $REFERENCE"
     exit 1
 fi
 
@@ -185,6 +243,13 @@ JOB_ID="${SLURM_JOB_ID:-manual}"
 # Include the SLURM job ID so repeated runs on the same POD5 input
 # do not overwrite one another when parameters differ.
 FASTQ_FILE="$OUTPUT_DIR/${POD5_PREFIX}_${JOB_ID}.fastq"
+BAM_FILE="$OUTPUT_DIR/${POD5_PREFIX}_${JOB_ID}.bam"
+OUTPUT_FILE="$FASTQ_FILE"
+OUTPUT_LABEL="FASTQ"
+if [[ "$OUTPUT_FORMAT" == "bam" ]]; then
+    OUTPUT_FILE="$BAM_FILE"
+    OUTPUT_LABEL="BAM"
+fi
 
 # Construct the directory used for barcode-separated FASTQ files.
 BARCODE_DIR="$OUTPUT_DIR/${POD5_PREFIX}_${JOB_ID}_barcodes"
@@ -199,10 +264,14 @@ BARCODE_DIR="$OUTPUT_DIR/${POD5_PREFIX}_${JOB_ID}_barcodes"
     echo "========================================="
     echo "Started:        $(date)"
     echo "POD5:           $POD5"
-    echo "Output FASTQ:   $FASTQ_FILE"
+    echo "Output format:  $OUTPUT_FORMAT"
+    echo "Output $OUTPUT_LABEL:   $OUTPUT_FILE"
+    echo "Reference:      ${REFERENCE:-none}"
     echo "Model:          $DORADO_MODEL"
     echo "Device:         $DEVICE"
     echo "Min q-score:    $MIN_QSCORE"
+    echo "Emit moves:     $EMIT_MOVES"
+    echo "MM2 opts:       ${MM2_OPTS:-none}"
     echo "Barcode mode:   $BARCODE_MODE"
     echo "Kit name:       ${KIT_NAME:-none}"
     echo "Modified bases: ${MODIFIED_BASES:-none}"
@@ -242,16 +311,29 @@ fi
 # --min-qscore:
 #   Filters out reads below the selected quality threshold.
 #
-# --emit-fastq:
-#   Produces FASTQ-formatted output.
 DORADO_ARGS=(
     basecaller
     "$DORADO_MODEL"
     "$POD5"
     --device "$DEVICE"
     --min-qscore "$MIN_QSCORE"
-    --emit-fastq
 )
+
+if [[ "$OUTPUT_FORMAT" == "fastq" ]]; then
+    # --emit-fastq produces FASTQ-formatted output for the Minimap2 path.
+    DORADO_ARGS+=(--emit-fastq)
+else
+    # --reference makes Dorado basecall and align in one step, producing BAM.
+    DORADO_ARGS+=(--reference "$REFERENCE")
+
+    if [[ "$EMIT_MOVES" == "yes" ]]; then
+        DORADO_ARGS+=(--emit-moves)
+    fi
+
+    if [[ -n "$MM2_OPTS" ]]; then
+        DORADO_ARGS+=(--mm2-opts "$MM2_OPTS")
+    fi
+fi
 
 # Add modified-base detection to the Dorado command when a model
 # or modification code was supplied.
@@ -276,24 +358,24 @@ fi
     echo "[INFO] Running Dorado basecaller."
     printf '[INFO] Command: dorado'
     printf ' %q' "${DORADO_ARGS[@]}"
-    echo " > $FASTQ_FILE"
+    echo " > $OUTPUT_FILE"
 } >> "$LOG_FILE"
 
 # Run Dorado basecalling.
 #
-# Standard output is written to the FASTQ file.
+# Standard output is written to the selected output file.
 # Standard error, including Dorado progress information, is appended
 # to the log file.
-dorado "${DORADO_ARGS[@]}" > "$FASTQ_FILE" 2>> "$LOG_FILE"
+dorado "${DORADO_ARGS[@]}" > "$OUTPUT_FILE" 2>> "$LOG_FILE"
 
-# Confirm that Dorado produced a nonempty FASTQ file.
-if [[ ! -s "$FASTQ_FILE" ]]; then
-    echo "[ERROR] FASTQ file is empty or was not created: $FASTQ_FILE" | tee -a "$LOG_FILE"
+# Confirm that Dorado produced a nonempty output file.
+if [[ ! -s "$OUTPUT_FILE" ]]; then
+    echo "[ERROR] $OUTPUT_LABEL file is empty or was not created: $OUTPUT_FILE" | tee -a "$LOG_FILE"
     exit 1
 fi
 
 # Perform barcode demultiplexing when requested.
-if [[ "$BARCODE_MODE" == "demux" ]]; then
+if [[ "$BARCODE_MODE" == "demux" && "$OUTPUT_FORMAT" == "fastq" ]]; then
     # Create the directory that will contain barcode-specific FASTQ files.
     mkdir -p "$BARCODE_DIR"
 
@@ -342,8 +424,9 @@ if [[ "$BARCODE_MODE" == "demux" ]]; then
     done
 fi
 
-# Calculate and write post-basecalling quality-control information.
-{
+if [[ "$OUTPUT_FORMAT" == "fastq" ]]; then
+    # Calculate and write post-basecalling quality-control information.
+    {
     echo ""
     echo "========================================="
     echo "  BASECALL QC"
@@ -419,10 +502,22 @@ fi
     # Record the completion time.
     echo "Completed: $(date)"
     echo "========================================="
-} >> "$LOG_FILE"
+    } >> "$LOG_FILE"
+else
+    {
+        echo ""
+        echo "========================================="
+        echo "  BASECALL QC"
+        echo "========================================="
+        echo "Dorado produced aligned BAM output."
+        echo "Move table emitted: $EMIT_MOVES"
+        echo "Completed: $(date)"
+        echo "========================================="
+    } >> "$LOG_FILE"
+fi
 
-# Print the primary FASTQ path to standard output.
+# Print the primary output path to standard output.
 #
 # This allows a parent workflow or calling script to capture the
-# generated FASTQ filename.
-echo "$FASTQ_FILE"
+# generated filename.
+echo "$OUTPUT_FILE"

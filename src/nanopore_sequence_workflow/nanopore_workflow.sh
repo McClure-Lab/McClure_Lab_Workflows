@@ -259,6 +259,8 @@ run_job() {
     local dorado_model=""
     local device=""
     local min_qscore=""
+    local output_format=""
+    local emit_moves=""
     local kit_name=""
     local barcode_mode=""
     local modified_bases=""
@@ -285,6 +287,8 @@ run_job() {
             --dorado-model) dorado_model="$2"; shift 2 ;;
             --device) device="$2"; shift 2 ;;
             --min-qscore) min_qscore="$2"; shift 2 ;;
+            --output-format) output_format="$2"; shift 2 ;;
+            --emit-moves) emit_moves="$2"; shift 2 ;;
             --kit-name) kit_name="$2"; shift 2 ;;
             --barcode-mode) barcode_mode="$2"; shift 2 ;;
             --modified-bases) modified_bases="$2"; shift 2 ;;
@@ -303,14 +307,31 @@ run_job() {
         esac
     done
 
-    # Confirm that the FASTQ and BAM output paths are under data/.
-    validate_data_output_dir "FASTQ output directory" "$fastq_output_dir"
+    output_format="${output_format:-fastq}"
+    emit_moves="${emit_moves:-yes}"
+
+    case "$output_format" in
+        fastq|bam) ;;
+        *)
+            echo "[ERROR] Dorado output must be fastq or bam."
+            exit 1
+            ;;
+    esac
+
+    validate_yes_no "--emit-moves" "$emit_moves"
+
+    # Confirm that the selected output paths are under data/.
+    if [[ "$output_format" == "fastq" ]]; then
+        validate_data_output_dir "FASTQ output directory" "$fastq_output_dir"
+    fi
     validate_data_output_dir "BAM output directory" "$bam_output_dir"
 
     # Confirm that all required directories are available on the compute node.
     require_existing_dir "Workflow root" "$WORKFLOW_ROOT"
     require_existing_dir "Log directory" "$LOG_DIR"
-    require_existing_dir "FASTQ output directory" "$fastq_output_dir"
+    if [[ "$output_format" == "fastq" ]]; then
+        require_existing_dir "FASTQ output directory" "$fastq_output_dir"
+    fi
     require_existing_dir "BAM output directory" "$bam_output_dir"
 
     # Prepare Dorado, Minimap2, and samtools.
@@ -320,8 +341,11 @@ run_job() {
     local pod5_prefix
     local dorado_log
     local minimap2_log
+    local dorado_output
     local fastq_file
     local bam_file
+    local dorado_output_dir
+    local dorado_mm2_opts
 
     # Derive the sample name from the POD5 file or directory name.
     #
@@ -341,48 +365,89 @@ run_job() {
     echo "[INFO] Nanopore workflow started: $(date)"
     echo "[INFO] POD5 prefix: $pod5_prefix"
     echo "[INFO] Dorado log: $dorado_log"
-    echo "[INFO] Minimap2 log: $minimap2_log"
+    echo "[INFO] Alignment/QC log: $minimap2_log"
+    echo "[INFO] Dorado output format: $output_format"
+
+    dorado_output_dir="$fastq_output_dir"
+    if [[ "$output_format" == "bam" ]]; then
+        dorado_output_dir="$bam_output_dir"
+    fi
+
+    # Dorado exposes supported minimap2 alignment settings through
+    # --mm2-opts. The workflow's sort, index, MAPQ/read-length, and
+    # primary-only settings are handled by samtools after Dorado writes BAM.
+    dorado_mm2_opts=""
+    if [[ "$output_format" == "bam" ]]; then
+        dorado_mm2_opts="-x $preset"
+        if [[ "$secondary" == "yes" ]]; then
+            dorado_mm2_opts="$dorado_mm2_opts --secondary"
+        fi
+    fi
 
     # Run the Dorado basecalling script.
     #
-    # The dorado_basecall.sh script prints its generated FASTQ path
+    # The dorado_basecall.sh script prints its generated output path
     # to standard output. Command substitution captures that path in
-    # the fastq_file variable.
-    fastq_file="$("$SRC_DIR/dorado_basecall.sh" \
+    # the dorado_output variable.
+    dorado_output="$("$SRC_DIR/dorado_basecall.sh" \
         --pod5 "$pod5" \
-        --output-dir "$fastq_output_dir" \
+        --output-dir "$dorado_output_dir" \
         --log-file "$dorado_log" \
         --dorado-model "$dorado_model" \
         --device "$device" \
         --min-qscore "$min_qscore" \
+        --output-format "$output_format" \
+        --reference "$reference" \
+        --emit-moves "$emit_moves" \
+        --mm2-opts "$dorado_mm2_opts" \
         --kit-name "$kit_name" \
         --barcode-mode "$barcode_mode" \
         --modified-bases "$modified_bases")"
 
-    # Report the FASTQ produced by Dorado.
-    echo "[INFO] Dorado complete: $fastq_file"
+    echo "[INFO] Dorado complete: $dorado_output"
 
-    # Run the Minimap2 alignment script using the FASTQ generated above.
-    #
-    # The minimap2_alignment.sh script prints its final sorted and
-    # indexed BAM path to standard output. Command substitution captures
-    # that path in the bam_file variable.
-    bam_file="$("$SRC_DIR/minimap2_alignment.sh" \
-        --fastq "$fastq_file" \
-        --reference "$reference" \
-        --output-dir "$bam_output_dir" \
-        --log-file "$minimap2_log" \
-        --preset "$preset" \
-        --threads "$threads" \
-        --secondary "$secondary" \
-        --sort "$sort_bam" \
-        --index "$index_bam" \
-        --min-mapq "$min_mapq" \
-        --min-read-length "$min_read_length" \
-        --primary-only "$primary_only")"
+    if [[ "$output_format" == "fastq" ]]; then
+        fastq_file="$dorado_output"
 
-    # Report the final BAM path and workflow completion time.
-    echo "[INFO] Minimap2 complete: $bam_file"
+        # Run the Minimap2 alignment script using the FASTQ generated above.
+        #
+        # The minimap2_alignment.sh script prints its final sorted and
+        # indexed BAM path to standard output. Command substitution captures
+        # that path in the bam_file variable.
+        bam_file="$("$SRC_DIR/minimap2_alignment.sh" \
+            --fastq "$fastq_file" \
+            --reference "$reference" \
+            --output-dir "$bam_output_dir" \
+            --log-file "$minimap2_log" \
+            --preset "$preset" \
+            --threads "$threads" \
+            --secondary "$secondary" \
+            --sort "$sort_bam" \
+            --index "$index_bam" \
+            --min-mapq "$min_mapq" \
+            --min-read-length "$min_read_length" \
+            --primary-only "$primary_only")"
+
+        echo "[INFO] Minimap2 complete: $bam_file"
+    else
+        # Sort, index, optionally filter, and QC the Dorado-aligned BAM.
+        bam_file="$("$SRC_DIR/minimap2_alignment.sh" \
+            --input-bam "$dorado_output" \
+            --output-dir "$bam_output_dir" \
+            --log-file "$minimap2_log" \
+            --preset "$preset" \
+            --threads "$threads" \
+            --secondary "$secondary" \
+            --sort "$sort_bam" \
+            --index "$index_bam" \
+            --min-mapq "$min_mapq" \
+            --min-read-length "$min_read_length" \
+            --primary-only "$primary_only")"
+
+        echo "[INFO] Dorado alignment QC complete: $bam_file"
+    fi
+
+    # Report workflow completion time.
     echo "[INFO] Nanopore workflow complete: $(date)"
 }
 
@@ -406,6 +471,8 @@ submit_workflow() {
     local reference=""
     local fastq_output_dir
     local bam_output_dir
+    local output_format
+    local emit_moves
 
     # Variables used to construct sample-specific names.
     local pod5_basename
@@ -429,9 +496,23 @@ submit_workflow() {
         read -r -p "Enter reference FASTA filename from data/fastq, data/, or an explicit path: " reference_input
     fi
 
-    # Prompt for the FASTQ output directory when it was not supplied.
-    if [[ -z "$fastq_output_input" ]]; then
+    echo
+    echo "Dorado output selection"
+    output_format="$(prompt_with_default "Should Dorado produce fastq or bam?" "bam")"
+
+    case "$output_format" in
+        fastq|bam) ;;
+        *)
+            echo "[ERROR] Dorado output must be fastq or bam."
+            exit 1
+            ;;
+    esac
+
+    # Prompt for the FASTQ output directory only when FASTQ is selected.
+    if [[ "$output_format" == "fastq" && -z "$fastq_output_input" ]]; then
         fastq_output_input="$(prompt_with_default "Enter FASTQ output directory under data/" "$DEFAULT_FASTQ_DIR")"
+    elif [[ -z "$fastq_output_input" ]]; then
+        fastq_output_input="$DEFAULT_FASTQ_DIR"
     fi
 
     # Prompt for the BAM output directory when it was not supplied.
@@ -468,8 +549,10 @@ submit_workflow() {
     fastq_output_dir="$(resolve_data_output_dir "$fastq_output_input")"
     bam_output_dir="$(resolve_data_output_dir "$bam_output_input")"
 
-    # Confirm that both output paths remain under WORKFLOW_ROOT/data.
-    validate_data_output_dir "FASTQ output directory" "$fastq_output_dir"
+    # Confirm that the selected output paths remain under WORKFLOW_ROOT/data.
+    if [[ "$output_format" == "fastq" ]]; then
+        validate_data_output_dir "FASTQ output directory" "$fastq_output_dir"
+    fi
     validate_data_output_dir "BAM output directory" "$bam_output_dir"
 
     # Derive the sample prefix from the POD5 file or directory name.
@@ -492,9 +575,17 @@ submit_workflow() {
     # Collect the minimum Dorado quality threshold.
     min_qscore="$(prompt_with_default "Enter --min-qscore" "6")"
 
-    # Inform the user that FASTQ output is required because Minimap2
-    # receives FASTQ as its input.
-    echo "[INFO] --emit-fastq is enabled because the alignment step requires FASTQ input."
+    # Move tables are retained by BAM output and are useful for
+    # downstream signal-aware tools. FASTQ cannot store this metadata.
+    emit_moves="$(prompt_with_default "Enter --emit-moves (yes or no; BAM output only)" "yes")"
+    validate_yes_no "--emit-moves" "$emit_moves"
+
+    if [[ "$output_format" == "fastq" ]]; then
+        echo "[INFO] --emit-fastq is enabled because the FASTQ path uses Minimap2 alignment."
+        echo "[INFO] --emit-moves is ignored for FASTQ output because FASTQ cannot store move-table tags."
+    else
+        echo "[INFO] Dorado will basecall and align with --reference, producing BAM output."
+    fi
 
     # Determine whether barcode demultiplexing should be performed.
     barcode_mode="$(prompt_with_default "Enter --barcode-mode (none or demux)" "none")"
@@ -535,7 +626,7 @@ submit_workflow() {
     threads="$(prompt_with_default "Enter --threads" "8")"
 
     # Determine whether secondary alignments should be retained.
-    secondary="$(prompt_with_default "Enter --secondary (yes or no)" "yes")"
+    secondary="$(prompt_with_default "Enter --secondary (yes or no)" "no")"
 
     # Sorting and indexing are required by the alignment QC steps.
     sort_bam="$(prompt_with_default "Enter --sort (yes required for QC)" "yes")"
@@ -547,7 +638,7 @@ submit_workflow() {
 
     # Determine whether the output should be filtered to primary
     # alignments only during BAM creation.
-    primary_only="$(prompt_with_default "Enter --primary-only (yes or no)" "no")"
+    primary_only="$(prompt_with_default "Enter --primary-only (yes or no)" "yes")"
 
     # Validate all yes/no alignment parameters.
     validate_yes_no "--secondary" "$secondary"
@@ -563,8 +654,11 @@ submit_workflow() {
         exit 1
     fi
 
-    # Create the selected FASTQ and BAM output directories.
-    mkdir -p "$fastq_output_dir" "$bam_output_dir"
+    # Create the selected output directories.
+    if [[ "$output_format" == "fastq" ]]; then
+        mkdir -p "$fastq_output_dir"
+    fi
+    mkdir -p "$bam_output_dir"
 
     # Load the required software on the submission node.
     #
@@ -575,7 +669,10 @@ submit_workflow() {
     # Display the resolved workflow and output locations.
     echo
     echo "[INFO] Workflow root: $WORKFLOW_ROOT"
-    echo "[INFO] FASTQ output directory: $fastq_output_dir"
+    echo "[INFO] Dorado output format: $output_format"
+    if [[ "$output_format" == "fastq" ]]; then
+        echo "[INFO] FASTQ output directory: $fastq_output_dir"
+    fi
     echo "[INFO] BAM output directory: $bam_output_dir"
     echo
     echo "Submitting nanopore workflow to SLURM..."
@@ -620,6 +717,8 @@ submit_workflow() {
         --dorado-model "$dorado_model" \
         --device "$device" \
         --min-qscore "$min_qscore" \
+        --output-format "$output_format" \
+        --emit-moves "$emit_moves" \
         --kit-name "$kit_name" \
         --barcode-mode "$barcode_mode" \
         --modified-bases "$modified_bases" \
@@ -638,13 +737,18 @@ submit_workflow() {
 
     # Display the submitted job and all expected output/log paths.
     echo "[INFO] Submitted SLURM job: $job_id"
-    echo "[INFO] Expected FASTQ: $fastq_output_dir/${pod5_prefix}_${log_job_id}.fastq"
-    echo "[INFO] Expected raw BAM: $bam_output_dir/${pod5_prefix}_${log_job_id}.bam"
+    if [[ "$output_format" == "fastq" ]]; then
+        echo "[INFO] Expected FASTQ: $fastq_output_dir/${pod5_prefix}_${log_job_id}.fastq"
+        echo "[INFO] Expected raw BAM: $bam_output_dir/${pod5_prefix}_${log_job_id}.bam"
+    else
+        echo "[INFO] Expected Dorado aligned BAM: $bam_output_dir/${pod5_prefix}_${log_job_id}.bam"
+        echo "[INFO] Expected raw BAM: $bam_output_dir/${pod5_prefix}_${log_job_id}.dorado.raw.bam"
+    fi
     echo "[INFO] Expected sorted indexed BAM: $bam_output_dir/${pod5_prefix}.sorted.indexed_${log_job_id}.bam"
     echo "[INFO] SLURM log:      $LOG_DIR/${pod5_prefix}.${log_job_id}.slurm.log"
     echo "[INFO] SLURM err:      $LOG_DIR/${pod5_prefix}.${log_job_id}.slurm.err"
     echo "[INFO] Dorado log:     $LOG_DIR/${pod5_prefix}.${log_job_id}.dorado.log"
-    echo "[INFO] Minimap2 log:   $LOG_DIR/${pod5_prefix}.${log_job_id}.minimap2.log"
+    echo "[INFO] Alignment/QC log: $LOG_DIR/${pod5_prefix}.${log_job_id}.minimap2.log"
 }
 
 # Main script entry point.

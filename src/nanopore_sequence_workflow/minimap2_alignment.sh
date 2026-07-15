@@ -8,11 +8,12 @@ set -euo pipefail
 
 # Display the expected command-line arguments for the alignment script.
 usage() {
-    echo "Usage: bash src/nanopore_sequence_workflow/minimap2_alignment.sh --fastq FASTQ --reference FASTA --output-dir DIR --log-file LOG --preset PRESET --threads N --secondary yes|no --sort yes|no --index yes|no --min-mapq N --min-read-length N --primary-only yes|no"
+    echo "Usage: bash src/nanopore_sequence_workflow/minimap2_alignment.sh (--fastq FASTQ --reference FASTA | --input-bam BAM) --output-dir DIR --log-file LOG --preset PRESET --threads N --secondary yes|no --sort yes|no --index yes|no --min-mapq N --min-read-length N --primary-only yes|no"
 }
 
 # Initialize the required input paths.
 FASTQ=""
+INPUT_BAM=""
 REFERENCE=""
 OUTPUT_DIR=""
 LOG_FILE=""
@@ -36,6 +37,12 @@ while [[ $# -gt 0 ]]; do
         # Path to the FASTQ file containing basecalled nanopore reads.
         --fastq)
             FASTQ="$2"
+            shift 2
+            ;;
+
+        # Path to a BAM already produced by Dorado basecaller alignment.
+        --input-bam|--bam)
+            INPUT_BAM="$2"
             shift 2
             ;;
 
@@ -132,29 +139,51 @@ done
 # Apply default values when any optional variable is empty.
 PRESET="${PRESET:-map-ont}"
 THREADS="${THREADS:-8}"
-SECONDARY="${SECONDARY:-yes}"
+SECONDARY="${SECONDARY:-no}"
 SORT_BAM="${SORT_BAM:-yes}"
 INDEX_BAM="${INDEX_BAM:-yes}"
 MIN_MAPQ="${MIN_MAPQ:-20}"
 MIN_READ_LENGTH="${MIN_READ_LENGTH:-1000}"
-PRIMARY_ONLY="${PRIMARY_ONLY:-no}"
+PRIMARY_ONLY="${PRIMARY_ONLY:-yes}"
 
 # Confirm that all required file and directory arguments were provided.
-if [[ -z "$FASTQ" || -z "$REFERENCE" || -z "$OUTPUT_DIR" || -z "$LOG_FILE" ]]; then
-    echo "[ERROR] Missing required Minimap2 argument."
+if [[ -z "$OUTPUT_DIR" || -z "$LOG_FILE" ]]; then
+    echo "[ERROR] Missing required alignment argument."
     usage
     exit 1
 fi
 
-# Confirm that the FASTQ file exists and is not empty.
-if [[ ! -s "$FASTQ" ]]; then
-    echo "[ERROR] FASTQ file is empty or not found: $FASTQ"
+if [[ -n "$FASTQ" && -n "$INPUT_BAM" ]]; then
+    echo "[ERROR] Use either --fastq or --input-bam, not both."
     exit 1
 fi
 
-# Confirm that the reference FASTA exists.
-if [[ ! -f "$REFERENCE" ]]; then
-    echo "[ERROR] Reference FASTA not found: $REFERENCE"
+if [[ -z "$FASTQ" && -z "$INPUT_BAM" ]]; then
+    echo "[ERROR] Either --fastq or --input-bam is required."
+    exit 1
+fi
+
+if [[ -n "$FASTQ" ]]; then
+    if [[ -z "$REFERENCE" ]]; then
+        echo "[ERROR] --reference is required when --fastq is used."
+        exit 1
+    fi
+
+    # Confirm that the FASTQ file exists and is not empty.
+    if [[ ! -s "$FASTQ" ]]; then
+        echo "[ERROR] FASTQ file is empty or not found: $FASTQ"
+        exit 1
+    fi
+
+    # Confirm that the reference FASTA exists.
+    if [[ ! -f "$REFERENCE" ]]; then
+        echo "[ERROR] Reference FASTA not found: $REFERENCE"
+        exit 1
+    fi
+fi
+
+if [[ -n "$INPUT_BAM" && ! -s "$INPUT_BAM" ]]; then
+    echo "[ERROR] Input BAM file is empty or not found: $INPUT_BAM"
     exit 1
 fi
 
@@ -211,29 +240,33 @@ fi
 # Create the output directory and the directory containing the log file.
 mkdir -p "$OUTPUT_DIR" "$(dirname "$LOG_FILE")"
 
-# Derive the sample prefix from the FASTQ filename.
+# Derive the sample prefix from the FASTQ or BAM filename.
 #
 # Examples:
 # sample.fastq becomes sample
 # sample.fq becomes sample
-FASTQ_BASENAME="$(basename "$FASTQ")"
-FASTQ_PREFIX="${FASTQ_BASENAME%.fastq}"
-FASTQ_PREFIX="${FASTQ_PREFIX%.fq}"
+INPUT_BASENAME="$(basename "${FASTQ:-$INPUT_BAM}")"
+INPUT_PREFIX="${INPUT_BASENAME%.fastq}"
+INPUT_PREFIX="${INPUT_PREFIX%.fq}"
+INPUT_PREFIX="${INPUT_PREFIX%.bam}"
 JOB_ID="${SLURM_JOB_ID:-manual}"
 
 # FASTQs produced by dorado_basecall.sh are named sample_jobid.fastq.
 # Reuse that job ID when present; otherwise use the current job ID.
-SAMPLE_PREFIX="$FASTQ_PREFIX"
+SAMPLE_PREFIX="$INPUT_PREFIX"
 OUTPUT_JOB_ID="$JOB_ID"
-if [[ "$FASTQ_PREFIX" == *_"$JOB_ID" ]]; then
-    SAMPLE_PREFIX="${FASTQ_PREFIX%_"$JOB_ID"}"
-elif [[ "$FASTQ_PREFIX" =~ ^(.+)_([0-9]+)$ ]]; then
+if [[ "$INPUT_PREFIX" == *_"$JOB_ID" ]]; then
+    SAMPLE_PREFIX="${INPUT_PREFIX%_"$JOB_ID"}"
+elif [[ "$INPUT_PREFIX" =~ ^(.+)_([0-9]+)$ ]]; then
     SAMPLE_PREFIX="${BASH_REMATCH[1]}"
     OUTPUT_JOB_ID="${BASH_REMATCH[2]}"
 fi
 
 # Define the raw unsorted BAM output.
 RAW_BAM="$OUTPUT_DIR/${SAMPLE_PREFIX}_${OUTPUT_JOB_ID}.bam"
+if [[ -n "$INPUT_BAM" ]]; then
+    RAW_BAM="$OUTPUT_DIR/${SAMPLE_PREFIX}_${OUTPUT_JOB_ID}.dorado.raw.bam"
+fi
 
 # Define the final sorted and indexed BAM output.
 SORTED_INDEXED_BAM="$OUTPUT_DIR/${SAMPLE_PREFIX}.sorted.indexed_${OUTPUT_JOB_ID}.bam"
@@ -286,11 +319,16 @@ fi
 # Write the complete alignment configuration to the main log file.
 {
     echo "========================================="
-    echo "  MINIMAP2 ALIGNMENT"
+    if [[ -n "$INPUT_BAM" ]]; then
+        echo "  DORADO BAM ALIGNMENT QC"
+    else
+        echo "  MINIMAP2 ALIGNMENT"
+    fi
     echo "========================================="
     echo "Started:         $(date)"
-    echo "FASTQ:           $FASTQ"
-    echo "Reference:       $REFERENCE"
+    echo "FASTQ:           ${FASTQ:-none}"
+    echo "Input BAM:       ${INPUT_BAM:-none}"
+    echo "Reference:       ${REFERENCE:-none}"
     echo "Raw BAM:         $RAW_BAM"
     echo "Final BAM:       $BAM_FILE"
     echo "Preset:          $PRESET"
@@ -314,47 +352,59 @@ echo "  Sample: $SAMPLE_PREFIX" >> "$QC_REPORT"
 echo "  Job ID: $OUTPUT_JOB_ID" >> "$QC_REPORT"
 echo "=========================================" >> "$QC_REPORT"
 
-# Build the Minimap2 command as a Bash array.
-#
-# -a:
-#   Produce SAM-formatted alignments.
-#
-# -x:
-#   Select the requested alignment preset.
-#
-# -t:
-#   Set the number of CPU threads.
-MINIMAP2_ARGS=(-ax "$PRESET" -t "$THREADS")
+if [[ -n "$FASTQ" ]]; then
+    # Build the Minimap2 command as a Bash array.
+    #
+    # -a:
+    #   Produce SAM-formatted alignments.
+    #
+    # -x:
+    #   Select the requested alignment preset.
+    #
+    # -t:
+    #   Set the number of CPU threads.
+    MINIMAP2_ARGS=(-ax "$PRESET" -t "$THREADS")
 
-# Add --secondary=no when secondary alignments were disabled.
-if [[ -n "$SECONDARY_FLAG" ]]; then
-    MINIMAP2_ARGS+=("$SECONDARY_FLAG")
+    # Add --secondary=no when secondary alignments were disabled.
+    if [[ -n "$SECONDARY_FLAG" ]]; then
+        MINIMAP2_ARGS+=("$SECONDARY_FLAG")
+    fi
+
+    # Add the reference FASTA and FASTQ input paths to the command.
+    MINIMAP2_ARGS+=("$REFERENCE" "$FASTQ")
+
+    # Record the exact Minimap2 and samtools conversion command in the log.
+    #
+    # %q prints each Minimap2 argument in a shell-escaped form.
+    {
+        echo ""
+        echo "[INFO] Running Minimap2 alignment."
+        printf '[INFO] Command: minimap2'
+        printf ' %q' "${MINIMAP2_ARGS[@]}"
+        echo " | samtools view ${SAMTOOLS_VIEW_ARGS[*]} -o $RAW_BAM"
+    } >> "$LOG_FILE"
+
+    # Align the nanopore reads to the reference genome.
+    #
+    # Minimap2 writes SAM records to standard output.
+    # The SAM records are immediately piped into samtools view, which:
+    # - converts them to BAM,
+    # - optionally applies primary-only filtering,
+    # - writes the raw BAM file.
+    #
+    # Error messages from both commands are appended to the log file.
+    minimap2 "${MINIMAP2_ARGS[@]}" 2>> "$LOG_FILE" | samtools view "${SAMTOOLS_VIEW_ARGS[@]}" -o "$RAW_BAM" - 2>> "$LOG_FILE"
+else
+    {
+        echo ""
+        echo "[INFO] Using Dorado aligned BAM as alignment input."
+        printf '[INFO] Command: samtools view'
+        printf ' %q' "${SAMTOOLS_VIEW_ARGS[@]}"
+        printf ' -o %q %q\n' "$RAW_BAM" "$INPUT_BAM"
+    } >> "$LOG_FILE"
+
+    samtools view "${SAMTOOLS_VIEW_ARGS[@]}" -o "$RAW_BAM" "$INPUT_BAM" 2>> "$LOG_FILE"
 fi
-
-# Add the reference FASTA and FASTQ input paths to the command.
-MINIMAP2_ARGS+=("$REFERENCE" "$FASTQ")
-
-# Record the exact Minimap2 and samtools conversion command in the log.
-#
-# %q prints each Minimap2 argument in a shell-escaped form.
-{
-    echo ""
-    echo "[INFO] Running Minimap2 alignment."
-    printf '[INFO] Command: minimap2'
-    printf ' %q' "${MINIMAP2_ARGS[@]}"
-    echo " | samtools view ${SAMTOOLS_VIEW_ARGS[*]} -o $RAW_BAM"
-} >> "$LOG_FILE"
-
-# Align the nanopore reads to the reference genome.
-#
-# Minimap2 writes SAM records to standard output.
-# The SAM records are immediately piped into samtools view, which:
-# - converts them to BAM,
-# - optionally applies primary-only filtering,
-# - writes the raw BAM file.
-#
-# Error messages from both commands are appended to the log file.
-minimap2 "${MINIMAP2_ARGS[@]}" 2>> "$LOG_FILE" | samtools view "${SAMTOOLS_VIEW_ARGS[@]}" -o "$RAW_BAM" - 2>> "$LOG_FILE"
 
 # Confirm that alignment produced a nonempty raw BAM file.
 if [[ ! -s "$RAW_BAM" ]]; then
