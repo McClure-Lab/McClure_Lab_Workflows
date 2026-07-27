@@ -32,40 +32,38 @@ def parse_args():
 
 def get_project_paths():
     """
-    Build paths to workflow-managed BAM directories.
+    Build paths to the workflow-managed BAM directory.
 
-    Sorted BAM files and BAM indexes are stored in fixed workflow locations so
-    they can be reused by multiple scripts without repeatedly sorting and
-    indexing the same input BAM.
+    Sorted BAM files and BAM indexes are stored next to source BAMs in data/bam
+    so users have only one BAM location to check.
 
     Returns
     -------
     tuple[str, str]
         A tuple containing:
-        - sorted_bam_dir: directory for standardized sorted BAM files
+        - bam_dir: directory for BAM files
         - index_dir: directory for BAM index files
     """
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    sorted_bam_dir = os.path.abspath(os.path.join(script_dir, "../../data/sorted_bam"))
-    index_dir = os.path.abspath(os.path.join(script_dir, "../../data/index_sorted_bam_bai"))
-    return sorted_bam_dir, index_dir
+    bam_dir = os.path.abspath(os.path.join(script_dir, "../../data/bam"))
+    return bam_dir, bam_dir
 
 
-def check_and_sort_bam(bam_path, sorted_bam_dir):
+def check_and_sort_bam(bam_path, bam_dir):
     """
     Ensure the input BAM is coordinate-sorted and stored with a standard name.
 
     Region-based read fetching requires a coordinate-sorted BAM. This function
     checks the BAM header to see whether the file is already sorted. If it is,
-    the BAM is copied into the workflow's sorted BAM directory. If it is not,
-    samtools sort is used to create a sorted copy.
+    the input path is used directly. If it is not, samtools sort is used to
+    create a sorted copy in data/bam.
 
     Parameters
     ----------
     bam_path : str
         Path to the input BAM file.
 
-    sorted_bam_dir : str
+    bam_dir : str
         Directory where the standardized sorted BAM should be stored.
 
     Returns
@@ -79,29 +77,34 @@ def check_and_sort_bam(bam_path, sorted_bam_dir):
 
     sort_order = header.get("HD", {}).get("SO", "unknown")
 
-    os.makedirs(sorted_bam_dir, exist_ok=True)
+    os.makedirs(bam_dir, exist_ok=True)
 
+    # If the BAM is already coordinate-sorted, use the user supplied file
+    # directly instead of redirecting to a renamed cache file.
+    if sort_order == "coordinate":
+        print(f"[INFO] Using provided sorted BAM: {bam_path}", file=sys.stderr)
+        return bam_path
+
+    # Avoid creating names like sample.sorted.indexed.sorted.indexed.bam when
+    # the input BAM filename already has the workflow suffix.
     original_base = os.path.splitext(os.path.basename(bam_path))[0]
-
-    # Avoid creating names like sample.sorted.sorted.indexed.bam when the input
-    # file already includes ".sorted" in its basename.
-    if original_base.endswith(".sorted"):
+    if original_base.endswith(".sorted.indexed"):
+        original_base = original_base[:-15]
+    elif original_base.endswith(".sorted"):
         original_base = original_base[:-7]
 
     standardized_path = os.path.join(
-        sorted_bam_dir,
+        bam_dir,
         f"{original_base}.sorted.indexed.bam"
     )
 
     # Reuse an existing standardized BAM so repeated workflow runs do not waste
     # time copying or sorting the same file again.
-    if os.path.exists(standardized_path):
+    if (
+        os.path.exists(standardized_path)
+        and os.path.getmtime(standardized_path) >= os.path.getmtime(bam_path)
+    ):
         print(f"[INFO] Reusing standardized BAM: {standardized_path}", file=sys.stderr)
-        return standardized_path
-
-    # If the BAM is already coordinate-sorted, copying is faster than sorting.
-    if sort_order == "coordinate":
-        subprocess.run(["cp", bam_path, standardized_path], check=True)
         return standardized_path
 
     subprocess.run(["samtools", "sort", "-o", standardized_path, bam_path], check=True)

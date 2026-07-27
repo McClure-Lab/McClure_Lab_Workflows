@@ -67,6 +67,36 @@ def parse_args():
         action="store_true",
         help="Draw RFB coordinate markers on the rain plots"
     )
+    parser.add_argument(
+        "--brdu_window_mode",
+        choices=["binary", "mean"],
+        default="binary",
+        help=(
+            "How to summarize BrdU probabilities in each T window. "
+            "binary thresholds probabilities before averaging; mean averages "
+            "raw probabilities directly."
+        )
+    )
+    parser.add_argument(
+        "--binary_threshold",
+        type=float,
+        default=0.5,
+        help="Probability threshold used by binary T-window mode. Defaults to 0.5."
+    )
+    parser.add_argument(
+        "--max_reads",
+        type=int,
+        default=None,
+        help="Maximum number of reads to plot. Defaults to all reads in the region."
+    )
+    parser.add_argument(
+        "--preserve_read_order_for_max_reads",
+        action="store_true",
+        help=(
+            "When --max_reads is set, keep the first N reads from input order "
+            "instead of randomly sampling."
+        )
+    )
     return parser.parse_args()
 
 
@@ -115,6 +145,46 @@ genbank_to_chr = {
     "CM007980.1": "p2-micron",
     "CM007981.1": "MT"
 }
+
+M_PHASE_CHROMOSOME_IDS = {
+    "CM007964.1",
+    "CM007965.1",
+    "CM007966.1",
+    "CM007967.1",
+    "CM007968.1",
+    "CM007969.1",
+    "CM007970.1",
+    "CM007971.1",
+    "CM007972.1",
+    "CM007973.1",
+    "CM007974.1",
+    "CM007975.1",
+    "CM007976.1",
+    "CM007977.1",
+    "CM007978.1",
+    "CM007979.1",
+}
+
+M_PHASE_EXCLUDED_REFERENCE_IDS = {
+    "LYZE01000019.1",
+    "LYZE01000020.1",
+    "LYZE01000021.1",
+    "CM007980.1",
+    "CM007981.1",
+}
+
+
+def is_m_phase(phase):
+    """Return True when the phase label refers to M phase/mitosis."""
+    return str(phase).strip().lower() in {"m", "m phase", "m-phase", "mphase", "mitosis"}
+
+
+def is_allowed_m_phase_reference(genbank_ids):
+    """M phase rainplots should only use reads aligned to chromosomes 1-16."""
+    reference_ids = {str(genbank_id) for genbank_id in genbank_ids}
+    if reference_ids & M_PHASE_EXCLUDED_REFERENCE_IDS:
+        return False
+    return reference_ids.issubset(M_PHASE_CHROMOSOME_IDS)
 
 
 def load_rfb_positions(rfb_dir, region_start, region_end):
@@ -184,8 +254,17 @@ def plot_rainplots_per_read(
     output_manifest=None,
     filename_prefix=None,
     filter_reads_with_rfb_only=False,
-    show_rfb_overlay=False
+    show_rfb_overlay=False,
+    brdu_window_mode="binary",
+    binary_threshold=0.5,
+    max_reads=None,
+    preserve_read_order_for_max_reads=False,
 ):
+    if not 0 <= binary_threshold <= 1:
+        raise ValueError("binary_threshold must be between 0 and 1.")
+    if max_reads is not None and max_reads < 1:
+        raise ValueError("max_reads must be at least 1 when provided.")
+
     df = load_rain_plot_input(input_file)
     outdir = get_output_dir(output_dir)
 
@@ -193,9 +272,8 @@ def plot_rainplots_per_read(
     df["mod_prob"] = pd.to_numeric(df["mod_prob"], errors="coerce", downcast="float")
     df = df.dropna(subset=["read_id", "start", "mod_prob"])
 
-    max_reads = 100
     show_scatter = True
-    threshold = 0.5
+    threshold = binary_threshold
 
     df["mod_base"] = df["mod_base"].astype(str).str.upper()
 
@@ -208,26 +286,36 @@ def plot_rainplots_per_read(
     if filter_reads_with_rfb_only:
         df = filter_reads_with_rfb(df, rfb_positions)
 
+    m_phase_only_chromosomes = is_m_phase(phase)
+
     # Get all unique reads with no filtering
     all_read_ids = df["read_id"].unique()
     if len(all_read_ids) == 0:
         raise ValueError("No reads found in the input file.")
 
-    # Randomly sample up to max_reads
-    sample_size = min(max_reads, len(all_read_ids))
-    sampled_reads = np.random.choice(all_read_ids, size=sample_size, replace=False)
-    df = df[df["read_id"].isin(sampled_reads)]
+    if max_reads is not None:
+        if not preserve_read_order_for_max_reads:
+            sample_size = min(max_reads, len(all_read_ids))
+            selected_reads = np.random.choice(
+                all_read_ids,
+                size=sample_size,
+                replace=False
+            )
+            df = df[df["read_id"].isin(selected_reads)]
 
     generated_paths = []
     region_records = []
+    skipped_m_phase_reference_reads = 0
+    skipped_unplottable_reads = 0
 
-    for i, (rid, sub) in enumerate(df.groupby("read_id", sort=False), start=1):
-        if i > max_reads:
-            break
-
+    for rid, sub in df.groupby("read_id", sort=False):
         sub = sub.sort_values("start", kind="mergesort")
 
         genbank_ids = sub["chrom"].astype(str).unique()
+        if m_phase_only_chromosomes and not is_allowed_m_phase_reference(genbank_ids):
+            skipped_m_phase_reference_reads += 1
+            continue
+
         if len(genbank_ids) == 1:
             chr_label = genbank_to_chr.get(genbank_ids[0], genbank_ids[0])
         else:
@@ -247,10 +335,12 @@ def plot_rainplots_per_read(
         bases = sub["mod_base"].to_numpy(dtype=object)
 
         if len(x) < 2:
+            skipped_unplottable_reads += 1
             continue
 
         t_idx = np.flatnonzero(bases == "T")
         if t_idx.size < t_window:
+            skipped_unplottable_reads += 1
             continue
 
         # Threshold: convert probabilities to binary (1 if >= threshold, else 0)
@@ -277,14 +367,20 @@ def plot_rainplots_per_read(
                 edges.append(x_left)
             edges.append(x_right)
 
-            # Mean of binary values = fraction of T's called as BrdU in this window
-            y_bin = float(np.mean(y_binary[window_t_idx]))
-            y_vals.append(y_bin)
+            if brdu_window_mode == "mean":
+                # Mean mode averages raw BrdU probabilities over the T window.
+                y_window = float(np.mean(y[window_t_idx]))
+            else:
+                # Binary mode keeps the original behavior: threshold first,
+                # then average to get the fraction of T's called as BrdU.
+                y_window = float(np.mean(y_binary[window_t_idx]))
+            y_vals.append(y_window)
 
         edges = np.asarray(edges, dtype=float)
         y_vals = np.asarray(y_vals, dtype=float)
 
         if len(edges) < 2 or len(y_vals) < 1:
+            skipped_unplottable_reads += 1
             continue
 
         edges = np.maximum.accumulate(edges)
@@ -293,15 +389,17 @@ def plot_rainplots_per_read(
             edges[-1] = edges[-1] + 1e-9
 
         if len(edges) != len(y_vals) + 1:
+            skipped_unplottable_reads += 1
             continue
 
         fig, ax = plt.subplots(figsize=(16, 4))
+        read_number = len(generated_paths) + 1
 
         # Scatter uses raw probabilities
         if show_scatter:
             ax.scatter(x, y, s=1, color="black", alpha=0.3)
 
-        # Staircase uses binary thresholded mean (fraction of BrdU per window)
+        # Staircase uses the selected T-window aggregation mode.
         ax.stairs(y_vals, edges, linewidth=2, color="black", fill=False)
 
         # Draw red vertical line at each RFB motif start position for this read
@@ -323,16 +421,24 @@ def plot_rainplots_per_read(
         ax.set_ylim(0, 1)
         ax.set_xlim(read_start / 1000.0, read_end / 1000.0)
         ax.set_xlabel("Genomic position (kb)")
-        ax.set_ylabel("BrdU incorporation rate (0–1)")
+        if brdu_window_mode == "mean":
+            y_label = "Mean BrdU probability (0-1)"
+            mode_label = "mean probability"
+        else:
+            y_label = "BrdU incorporation rate (0-1)"
+            mode_label = f"binary threshold >= {threshold:g}"
+
+        ax.set_ylabel(y_label)
         ax.set_title(
-            f"{phase} Rain Plot {rid} - Read {i}\n"
-            f"Chromosome: {chr_label} | Window: {read_start}-{read_end} bp"
+            f"{phase} Rain Plot {rid} - Read {read_number}\n"
+            f"Chromosome: {chr_label} | Window: {read_start}-{read_end} bp | "
+            f"T-window mode: {mode_label}"
         )
 
         if filename_prefix:
-            output_name = f"rainplot_{filename_prefix}_{i:03d}.png"
+            output_name = f"rainplot_{filename_prefix}_{read_number:03d}.png"
         else:
-            output_name = f"rainplot_chr{chr_label}_{region_start}_{region_end}_{i:03d}.png"
+            output_name = f"rainplot_chr{chr_label}_{region_start}_{region_end}_{read_number:03d}.png"
 
         outpath = os.path.join(outdir, output_name)
 
@@ -347,6 +453,30 @@ def plot_rainplots_per_read(
                 "read_start": read_start,
                 "read_end": read_end,
             }
+        )
+
+        if max_reads is not None and preserve_read_order_for_max_reads and len(generated_paths) >= max_reads:
+            break
+
+    if skipped_m_phase_reference_reads:
+        print(
+            "[INFO] "
+            f"Skipped {skipped_m_phase_reference_reads} M-phase reads aligned outside chromosomes 1-16.",
+            flush=True,
+        )
+
+    if skipped_unplottable_reads:
+        print(
+            "[INFO] "
+            f"Skipped {skipped_unplottable_reads} reads that did not have enough BrdU/T-window data to plot.",
+            flush=True,
+        )
+
+    if max_reads is not None and len(generated_paths) < max_reads:
+        print(
+            "[WARN] "
+            f"Requested {max_reads} rainplots, but only {len(generated_paths)} plottable reads were available.",
+            flush=True,
         )
 
     if output_manifest:
@@ -384,5 +514,9 @@ if __name__ == "__main__":
         args.output_manifest,
         args.filename_prefix,
         args.filter_reads_with_rfb,
-        args.show_rfb_overlay
+        args.show_rfb_overlay,
+        args.brdu_window_mode,
+        args.binary_threshold,
+        args.max_reads,
+        args.preserve_read_order_for_max_reads,
     )

@@ -7,7 +7,9 @@ This repository provides workflow-based analysis utilities for the McClure Lab.
 Current workflows:
 
 - `Rain Plot Workflow`: extracts BrdU calls from BAM data and generates per-read rain plot outputs for a selected genomic region
-- `Genomic Browser workflow`: currently in progress and intended to support genomic browser-style visualization workflows
+- `Nanopore Sequence Workflow`: runs Dorado basecalling, minimap2/Dorado alignment QC, and DNAscent BrdU detection from nanopore POD5 data
+- `Genome Browser Workflow`: extracts BrdU bedGraphs from modBAM files and generates smoothed or unsmoothed per-chromosome genome browser plots
+- `Utility Workflow Helpers`: optional scripts for merging BAMs, summarizing BrdU signal, extracting BrdU-positive reads, lifting BrdU BEDs, and comparing points of interest
 
 Each workflow has its own dedicated markdown file with workflow-specific usage details.
 
@@ -39,5 +41,8 @@ From there, users can follow the instructions in the workflow-specific markdown 
 Current workflow documentation:
 
 - `docs/rain_plot_workflow.md`
+- `docs/nanopore_sequence_workflow.md`
+- `docs/genome_browser_workflow.md`
+- `docs/utils_workflow_helpers.md`
 
 Additional workflow documentation can be added here as new workflows are completed.

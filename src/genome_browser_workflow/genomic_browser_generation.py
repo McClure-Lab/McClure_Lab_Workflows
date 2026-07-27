@@ -21,6 +21,7 @@ from matplotlib.ticker import ScalarFormatter
 plt.rcParams["agg.path.chunksize"] = 10000
 
 SUBTEL_SIZE = 30000
+MAIN_SIGNAL_Y_AXIS_MAX = 20.0
 
 # Genbank ID's mapped to their corresponding chromosome
 GENBANK_TO_CHR = {
@@ -286,15 +287,17 @@ def smooth_signals(chrom_df, window):
     """
     Add smoothed coverage, BrdU count, and BrdU percentage columns.
 
-    Uses a centered rolling window to smooth Nvalid_cov and Nmod, then calculates
-    BrdU_pct_plot as 100 * summed Nmod / summed Nvalid_cov within the same
-    window. Returns the updated chromosome DataFrame.
+    Uses a centered rolling maximum for Nvalid_cov and Nmod so isolated high
+    coverage and high-incorporation bins remain visible at their true raw count
+    instead of being diluted by the smoothing window.
+    BrdU_pct_plot is still calculated as 100 * summed Nmod / summed Nvalid_cov
+    within the same window because it is a rate over local coverage.
     """
     chrom_df["Coverage_plot"] = (
-        chrom_df["Nvalid_cov"].rolling(window=window, min_periods=1, center=True).mean()
+        chrom_df["Nvalid_cov"].rolling(window=window, min_periods=1, center=True).max()
     )
     chrom_df["BrdU_plot"] = (
-        chrom_df["Nmod"].rolling(window=window, min_periods=1, center=True).mean()
+        chrom_df["Nmod"].rolling(window=window, min_periods=1, center=True).max()
     )
     nmod_window = (
         chrom_df["Nmod"].rolling(window=window, min_periods=1, center=True).sum()
@@ -534,7 +537,7 @@ def add_ruler_max_labels(ruler_axes, chrom_df, smoothed):
     """
     Add max-value labels to the coverage, BrdU, and BrdU percentage ruler tracks.
 
-    For smoothed plots, labels each track with both the smoothed maximum and raw
+    For smoothed plots, labels each track with both the plotted maximum and raw
     maximum. For unsmoothed plots, labels each track with only the raw maximum.
     """
     if smoothed:
@@ -542,14 +545,14 @@ def add_ruler_max_labels(ruler_axes, chrom_df, smoothed):
             ruler_axes["coverage"],
             f"{float(chrom_df['Coverage_plot'].max()):.2f}",
             f"{float(chrom_df['Nvalid_cov'].max()):.0f}",
-            "smooth max",
+            "plot max",
             "raw max",
         )
         replace_axis_label(
             ruler_axes["brdu"],
             f"{float(chrom_df['BrdU_plot'].max()):.2f}",
             f"{float(chrom_df['Nmod'].max()):.0f}",
-            "smooth max",
+            "plot max",
             "raw max",
         )
         replace_axis_label(
@@ -668,20 +671,50 @@ def plot_chromosome(
             alpha=0.6,
             label="Coverage (Nvalid_cov, smoothed)",
         )
-        ax.plot(x, brdu, color="blue", linewidth=1.2, label="BrdU count (Nmod, smoothed)")
+        ax.plot(
+            x,
+            brdu,
+            color="blue",
+            linewidth=1.2,
+            label="BrdU count (Nmod, peak-preserving smoothed)",
+        )
 
     signal_max = max(
         float(np.nanmax(coverage)) if np.any(np.isfinite(coverage)) else 0.0,
         float(np.nanmax(brdu)) if np.any(np.isfinite(brdu)) else 0.0,
     )
-    ax.set_ylim(0, signal_max * 1.05 if signal_max > 0 else 1.0)
+    natural_ymax = signal_max * 1.05 if signal_max > 0 else 1.0
+    y_axis_capped = natural_ymax > MAIN_SIGNAL_Y_AXIS_MAX
+    display_ymax = min(natural_ymax, MAIN_SIGNAL_Y_AXIS_MAX)
+    ax.set_ylim(0, display_ymax)
     ax.set_xlim(0, chr_length)
-    ax.set_ylabel("Read count")
+    ylabel = "Read count"
+    if y_axis_capped:
+        ylabel += f" (display capped at {MAIN_SIGNAL_Y_AXIS_MAX:g})"
+    ax.set_ylabel(ylabel)
     ax.set_xlabel("Genomic position (bp)")
     ax.set_title(
         f"{title_prefix}BrdU pileup along chromosome {chrom} "
         f"({mode_label}; subtelomeres highlighted)"
     )
+    if y_axis_capped:
+        raw_cov_mean = float(chrom_df["Nvalid_cov"].mean())
+        raw_cov_median = float(chrom_df["Nvalid_cov"].median())
+        raw_cov_max = float(chrom_df["Nvalid_cov"].max())
+        ax.text(
+            0.995,
+            0.95,
+            (
+                f"Raw coverage: mean={raw_cov_mean:.2f}x, "
+                f"median={raw_cov_median:.2f}x, max={raw_cov_max:.0f}x; "
+                f"axis capped at {MAIN_SIGNAL_Y_AXIS_MAX:g}"
+            ),
+            ha="right",
+            va="top",
+            transform=ax.transAxes,
+            fontsize=8,
+            bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.75, "pad": 2},
+        )
     ax.xaxis.set_major_formatter(ScalarFormatter(useOffset=False))
     ax.ticklabel_format(style="plain", axis="x")
     ax.grid(True, axis="x", alpha=0.15)

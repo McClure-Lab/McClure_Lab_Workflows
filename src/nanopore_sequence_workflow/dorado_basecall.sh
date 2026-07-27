@@ -8,7 +8,7 @@ set -euo pipefail
 
 # Display the expected command-line arguments for this script.
 usage() {
-    echo "Usage: bash src/nanopore_sequence_workflow/dorado_basecall.sh --pod5 POD5_FILE_OR_DIR --output-dir DIR --log-file LOG --model MODEL --device DEVICE --min-qscore N [--output-format fastq|bam] [--reference FASTA] [--emit-moves yes|no] [--mm2-opts OPTS] [--kit-name KIT] [--barcode-mode none|demux] [--modified-bases MODEL_OR_CODE]"
+    echo "Usage: bash src/nanopore_sequence_workflow/dorado_basecall.sh --pod5 POD5_FILE_OR_DIR --output-dir DIR --log-file LOG --model MODEL --device DEVICE --min-qscore N [--max-reads N] [--output-format fastq|bam] [--reference FASTA] [--emit-moves yes|no] [--mm2-opts OPTS] [--kit-name KIT] [--barcode-mode none|demux] [--barcode-output-dir DIR] [--modified-bases MODEL_OR_CODE]"
 }
 
 # Initialize all input variables.
@@ -25,12 +25,14 @@ LOG_FILE=""
 DORADO_MODEL=""
 DEVICE=""
 MIN_QSCORE=""
+MAX_READS=""
 OUTPUT_FORMAT="fastq"
 REFERENCE=""
 EMIT_MOVES="yes"
 MM2_OPTS=""
 KIT_NAME=""
 BARCODE_MODE="none"
+BARCODE_OUTPUT_DIR=""
 MODIFIED_BASES=""
 
 # Process all command-line arguments supplied to the script.
@@ -74,6 +76,12 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
 
+        # Optional maximum number of reads Dorado should basecall.
+        --max-reads)
+            MAX_READS="$2"
+            shift 2
+            ;;
+
         # Select whether Dorado writes FASTQ or aligned BAM output.
         --output-format)
             OUTPUT_FORMAT="$2"
@@ -114,6 +122,12 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
 
+        # Directory root where barcode-separated output directories are written.
+        --barcode-output-dir)
+            BARCODE_OUTPUT_DIR="$2"
+            shift 2
+            ;;
+
         # Optional Dorado modified-base model or modification code.
         --modified-bases)
             MODIFIED_BASES="$2"
@@ -151,9 +165,11 @@ done
 DORADO_MODEL="${DORADO_MODEL:-sup}"
 DEVICE="${DEVICE:-cuda:0}"
 MIN_QSCORE="${MIN_QSCORE:-6}"
+MAX_READS="${MAX_READS:-}"
 OUTPUT_FORMAT="${OUTPUT_FORMAT:-fastq}"
 EMIT_MOVES="${EMIT_MOVES:-yes}"
 BARCODE_MODE="${BARCODE_MODE:-none}"
+BARCODE_OUTPUT_DIR="${BARCODE_OUTPUT_DIR:-$OUTPUT_DIR}"
 
 # Confirm that the required arguments were provided.
 if [[ -z "$POD5" || -z "$OUTPUT_DIR" || -z "$LOG_FILE" ]]; then
@@ -188,6 +204,12 @@ esac
 
 if [[ "$OUTPUT_FORMAT" == "bam" && -z "$REFERENCE" ]]; then
     echo "[ERROR] --reference is required when --output-format bam is used."
+    exit 1
+fi
+
+if [[ -n "$MAX_READS" && ! "$MAX_READS" =~ ^[1-9][0-9]*$ ]]; then
+    echo "[ERROR] Invalid --max-reads value: $MAX_READS"
+    echo "[ERROR] Expected a positive integer or leave blank to basecall all reads."
     exit 1
 fi
 
@@ -251,8 +273,8 @@ if [[ "$OUTPUT_FORMAT" == "bam" ]]; then
     OUTPUT_LABEL="BAM"
 fi
 
-# Construct the directory used for barcode-separated FASTQ files.
-BARCODE_DIR="$OUTPUT_DIR/${POD5_PREFIX}_${JOB_ID}_barcodes"
+# Construct the directory used for barcode-separated files.
+BARCODE_DIR="$BARCODE_OUTPUT_DIR/${POD5_PREFIX}_${JOB_ID}"
 
 # Write the basecalling configuration to the log file.
 #
@@ -270,10 +292,13 @@ BARCODE_DIR="$OUTPUT_DIR/${POD5_PREFIX}_${JOB_ID}_barcodes"
     echo "Model:          $DORADO_MODEL"
     echo "Device:         $DEVICE"
     echo "Min q-score:    $MIN_QSCORE"
+    echo "Max reads:      ${MAX_READS:-all}"
+    echo "Trim adapters:  no (--no-trim always enabled)"
     echo "Emit moves:     $EMIT_MOVES"
     echo "MM2 opts:       ${MM2_OPTS:-none}"
     echo "Barcode mode:   $BARCODE_MODE"
     echo "Kit name:       ${KIT_NAME:-none}"
+    echo "Barcode dir:    $BARCODE_DIR"
     echo "Modified bases: ${MODIFIED_BASES:-none}"
     echo "SLURM job ID:   ${SLURM_JOB_ID:-not_set}"
     echo "========================================="
@@ -317,7 +342,12 @@ DORADO_ARGS=(
     "$POD5"
     --device "$DEVICE"
     --min-qscore "$MIN_QSCORE"
+    --no-trim
 )
+
+if [[ -n "$MAX_READS" ]]; then
+    DORADO_ARGS+=(--max-reads "$MAX_READS")
+fi
 
 if [[ "$OUTPUT_FORMAT" == "fastq" ]]; then
     # --emit-fastq produces FASTQ-formatted output for the Minimap2 path.
@@ -341,12 +371,10 @@ if [[ -n "$MODIFIED_BASES" ]]; then
     DORADO_ARGS+=(--modified-bases "$MODIFIED_BASES")
 fi
 
-# When demultiplexing is requested, supply the sequencing-kit name.
-#
-# --no-trim tells Dorado not to remove barcode or adapter sequence
-# during the initial basecalling step.
+# When demultiplexing is requested, supply the sequencing-kit name so
+# barcode classification happens during the initial basecalling step.
 if [[ "$BARCODE_MODE" == "demux" ]]; then
-    DORADO_ARGS+=(--kit-name "$KIT_NAME" --no-trim)
+    DORADO_ARGS+=(--kit-name "$KIT_NAME")
 fi
 
 # Record the exact Dorado command in the log file.
@@ -375,8 +403,8 @@ if [[ ! -s "$OUTPUT_FILE" ]]; then
 fi
 
 # Perform barcode demultiplexing when requested.
-if [[ "$BARCODE_MODE" == "demux" && "$OUTPUT_FORMAT" == "fastq" ]]; then
-    # Create the directory that will contain barcode-specific FASTQ files.
+if [[ "$BARCODE_MODE" == "demux" ]]; then
+    # Create the directory that will contain barcode-specific files.
     mkdir -p "$BARCODE_DIR"
 
     # Record the start of the demultiplexing stage.
@@ -388,38 +416,50 @@ if [[ "$BARCODE_MODE" == "demux" && "$OUTPUT_FORMAT" == "fastq" ]]; then
 
     # Separate the basecalled reads by barcode.
     #
-    # --kit-name:
-    #   Tells Dorado which barcode kit was used.
-    #
     # --output-dir:
-    #   Specifies where the barcode FASTQ files are written.
+    #   Specifies where the barcode files are written.
     #
-    # --emit-fastq:
-    #   Produces FASTQ output for each barcode classification.
-    dorado demux "$FASTQ_FILE" \
-        --kit-name "$KIT_NAME" \
-        --output-dir "$BARCODE_DIR" \
-        --emit-fastq \
-        >> "$LOG_FILE" 2>&1
+    # --no-classify:
+    #   Uses the barcode classifications already added by basecalling.
+    DEMUX_ARGS=(
+        demux
+        "$OUTPUT_FILE"
+        --output-dir "$BARCODE_DIR"
+        --no-classify
+    )
 
-    # Rename Dorado's barcode FASTQ outputs so every filename begins
+    if [[ "$OUTPUT_FORMAT" == "fastq" ]]; then
+        # --emit-fastq produces FASTQ output for each barcode classification.
+        DEMUX_ARGS+=(--emit-fastq)
+    fi
+
+    {
+        printf '[INFO] Command: dorado'
+        printf ' %q' "${DEMUX_ARGS[@]}"
+        echo
+    } >> "$LOG_FILE"
+
+    dorado "${DEMUX_ARGS[@]}" >> "$LOG_FILE" 2>&1
+
+    # Rename Dorado's barcode outputs so every filename begins
     # with the original POD5 sample prefix and job ID.
-    for file in "$BARCODE_DIR"/*.fastq; do
-        # Skip the loop when no FASTQ files matched the wildcard.
-        [[ -e "$file" ]] || continue
+    for file in "$BARCODE_DIR"/*; do
+        # Skip the loop when no barcode files matched the wildcard.
+        [[ -f "$file" ]] || continue
 
         basename_file="$(basename "$file")"
+        extension="${basename_file##*.}"
 
         # Rename classified barcode files.
         #
         # Example:
         # barcode01.fastq becomes sample_jobid_barcode01.fastq
         if [[ "$basename_file" =~ (barcode[0-9]+) ]]; then
-            mv "$file" "$BARCODE_DIR/${POD5_PREFIX}_${JOB_ID}_${BASH_REMATCH[1]}.fastq"
+            mv "$file" "$BARCODE_DIR/${POD5_PREFIX}_${JOB_ID}_${BASH_REMATCH[1]}.$extension"
 
         # Rename reads that could not be assigned to a barcode.
         elif [[ "$basename_file" == *unclassified* ]]; then
-            mv "$file" "$BARCODE_DIR/${POD5_PREFIX}_${JOB_ID}_unclassified.fastq"
+            mv "$file" "$BARCODE_DIR/${POD5_PREFIX}_${JOB_ID}_unclassified.$extension"
         fi
     done
 fi

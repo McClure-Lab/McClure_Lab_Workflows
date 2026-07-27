@@ -5,6 +5,7 @@ import argparse
 import subprocess
 import sys
 import os
+import re
 
 
 def parse_args():
@@ -21,47 +22,126 @@ def parse_args():
         end coordinate, optional read ID, and optional output file path.
     """
     parser = argparse.ArgumentParser(
-        description="Extract BrdU modification data from a BAM file in a specific region."
+        description=(
+            "Extract BrdU modification data from a BAM file in a specific region "
+            "or for an exact read-ID list."
+        )
     )
     parser.add_argument("bam")
-    parser.add_argument("-c", "--chrom", required=True)
-    parser.add_argument("-s", "--start", required=True, type=int)
-    parser.add_argument("-e", "--end", required=True, type=int)
+    parser.add_argument("-c", "--chrom", default=None)
+    parser.add_argument("-s", "--start", default=None, type=int)
+    parser.add_argument("-e", "--end", default=None, type=int)
     parser.add_argument("-r", "--read_id", default=None)
+    parser.add_argument(
+        "--read_ids_file",
+        default=None,
+        help=(
+            "Optional TSV or plain-text file containing read IDs to include. "
+            "TSV files default to the read_id column."
+        ),
+    )
+    parser.add_argument(
+        "--read_id_column",
+        default="read_id",
+        help="Column name to read from --read_ids_file when it has a header.",
+    )
+    parser.add_argument(
+        "--read_ids_limit",
+        type=int,
+        default=None,
+        help="Maximum number of read IDs to load from --read_ids_file.",
+    )
     parser.add_argument("-o", "--output", default=None)
     return parser.parse_args()
 
 
+def load_read_ids(read_ids_file, read_id_column="read_id", limit=None):
+    """
+    Load read IDs from a TSV/CSV/plain-text file while preserving file order.
+
+    The rank files produced by the BrdU summary utilities contain a read_id
+    column. For simpler one-ID-per-line files, the first non-empty field on each
+    line is used.
+    """
+    read_ids = []
+    seen = set()
+
+    if limit is not None and limit < 1:
+        raise ValueError("read ID limit must be at least 1 when provided.")
+
+    def add_read_id(value):
+        value = value.strip()
+        if value and value not in seen:
+            read_ids.append(value)
+            seen.add(value)
+
+    def split_fields(line, delimiter):
+        stripped = line.rstrip("\n")
+        if delimiter:
+            return stripped.split(delimiter)
+        return re.split(r"\s+", stripped.strip())
+
+    with open(read_ids_file, "r", encoding="utf-8") as handle:
+        first_line = handle.readline()
+        if not first_line:
+            return read_ids
+
+        if "\t" in first_line:
+            delimiter = "\t"
+        elif "," in first_line:
+            delimiter = ","
+        else:
+            delimiter = None
+
+        first_fields = split_fields(first_line, delimiter)
+
+        if read_id_column in first_fields:
+            read_id_index = first_fields.index(read_id_column)
+        else:
+            read_id_index = 0
+            value = first_fields[read_id_index].strip()
+            add_read_id(value)
+
+        for line in handle:
+            if limit is not None and len(read_ids) >= limit:
+                break
+            if not line.strip():
+                continue
+            fields = split_fields(line, delimiter)
+            if read_id_index >= len(fields):
+                continue
+            add_read_id(fields[read_id_index])
+
+    return read_ids
+
+
 def get_project_paths():
     """
-    Build paths to workflow-managed BAM output directories.
+    Build paths to the workflow-managed BAM directory.
 
-    The sorted BAMs and BAM indexes are stored in fixed workflow directories so
-    that downstream scripts can reuse them instead of repeatedly sorting and
-    indexing the same BAM file.
+    Sorted BAMs and BAM indexes are stored next to the source BAMs in data/bam
+    so users have only one BAM location to check.
 
     Returns
     -------
     tuple[str, str]
         A tuple containing:
-        - sorted_bam_dir: directory for standardized sorted BAM files
+        - bam_dir: directory for BAM files
         - index_dir: directory for BAM index files
     """
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    sorted_bam_dir = os.path.abspath(os.path.join(script_dir, "../../data/sorted_bam"))
-    index_dir = os.path.abspath(os.path.join(script_dir, "../../data/index_sorted_bam_bai"))
-    return sorted_bam_dir, index_dir
+    bam_dir = os.path.abspath(os.path.join(script_dir, "../../data/bam"))
+    return bam_dir, bam_dir
 
 
-def check_and_sort_bam(bam_path, sorted_bam_dir):
+def check_and_sort_bam(bam_path, bam_dir):
     """
     Ensure the BAM file is coordinate-sorted and saved with a standardized name.
 
     Region-based BAM fetching requires a coordinate-sorted and indexed BAM. This
     function checks the BAM header to see whether the input is already sorted.
-    If it is already coordinate-sorted, the BAM is copied into the workflow's
-    sorted BAM directory. If it is not sorted, samtools sort is used to create a
-    sorted copy.
+    If it is already coordinate-sorted, the input path is used directly. If it
+    is not sorted, samtools sort is used to create a sorted copy in data/bam.
 
     The output name is standardized as:
         <original_basename>.sorted.indexed.bam
@@ -73,7 +153,7 @@ def check_and_sort_bam(bam_path, sorted_bam_dir):
     bam_path : str
         Path to the input BAM file.
 
-    sorted_bam_dir : str
+    bam_dir : str
         Directory where the sorted/standardized BAM should be stored.
 
     Returns
@@ -87,28 +167,31 @@ def check_and_sort_bam(bam_path, sorted_bam_dir):
 
     sort_order = header.get("HD", {}).get("SO", "unknown")
 
-    os.makedirs(sorted_bam_dir, exist_ok=True)
+    os.makedirs(bam_dir, exist_ok=True)
 
+    # If the BAM header says it is already coordinate-sorted, use the user
+    # supplied file directly instead of redirecting to a renamed cache file.
+    if sort_order == "coordinate":
+        print(f"[INFO] Using provided sorted BAM: {bam_path}", file=sys.stderr)
+        return bam_path
+
+    # Avoid creating names like sample.sorted.indexed.sorted.indexed.bam when
+    # the input BAM filename already has the workflow suffix.
     original_base = os.path.splitext(os.path.basename(bam_path))[0]
-
-    # Avoid creating names like sample.sorted.sorted.indexed.bam when the input
-    # BAM filename already ends with ".sorted".
-    if original_base.endswith(".sorted"):
+    if original_base.endswith(".sorted.indexed"):
+        original_base = original_base[:-15]
+    elif original_base.endswith(".sorted"):
         original_base = original_base[:-7]
 
     standardized_filename = f"{original_base}.sorted.indexed.bam"
-    standardized_path = os.path.join(sorted_bam_dir, standardized_filename)
+    standardized_path = os.path.join(bam_dir, standardized_filename)
 
     # Reuse an existing standardized BAM to save time on repeated workflow runs.
-    if os.path.exists(standardized_path):
+    if (
+        os.path.exists(standardized_path)
+        and os.path.getmtime(standardized_path) >= os.path.getmtime(bam_path)
+    ):
         print(f"[INFO] Reusing standardized BAM: {standardized_path}", file=sys.stderr)
-        return standardized_path
-
-    # If the BAM header says it is already coordinate-sorted, copying is faster
-    # than running samtools sort again.
-    if sort_order == "coordinate":
-        print(f"[INFO] Copying sorted BAM → {standardized_path}", file=sys.stderr)
-        subprocess.run(["cp", bam_path, standardized_path], check=True)
         return standardized_path
 
     print(f"[INFO] Sorting BAM → {standardized_path}", file=sys.stderr)
@@ -124,8 +207,7 @@ def check_and_index_bam(bam_path, index_dir):
     function creates the index if it does not exist, or rebuilds it if the BAM
     file is newer than the index.
 
-    The index is written to the workflow index directory rather than next to the
-    BAM file so all generated indexes are kept in one place.
+    The index is written next to the BAM file in data/bam.
 
     Parameters
     ----------
@@ -165,7 +247,15 @@ def check_and_index_bam(bam_path, index_dir):
     return index_path
 
 
-def extract_brdu(bam_path, chrom, start, end, read_id_filter=None):
+def iter_candidate_reads(bam, chrom=None, start=None, end=None):
+    """Yield reads either from a requested region or from the whole BAM."""
+    if chrom is None:
+        yield from bam.fetch(until_eof=True)
+    else:
+        yield from bam.fetch(chrom, start, end)
+
+
+def extract_brdu(bam_path, chrom=None, start=None, end=None, read_id_filter=None, read_ids=None):
     """
     Extract BrdU modification calls from reads overlapping a genomic region.
 
@@ -182,17 +272,20 @@ def extract_brdu(bam_path, chrom, start, end, read_id_filter=None):
     bam_path : str
         Path to the sorted and indexed BAM file.
 
-    chrom : str
+    chrom : str, optional
         Chromosome or contig name to fetch from the BAM.
 
-    start : int
+    start : int, optional
         Start coordinate of the region, using 0-based BED-style coordinates.
 
-    end : int
+    end : int, optional
         End coordinate of the region, using a half-open interval.
 
     read_id_filter : str, optional
         Optional substring used to restrict extraction to a specific read ID.
+
+    read_ids : list[str], optional
+        Optional exact read ID list used to restrict extraction to many reads.
 
     Returns
     -------
@@ -201,19 +294,24 @@ def extract_brdu(bam_path, chrom, start, end, read_id_filter=None):
         chrom, start, end, read_id, base, normalized_probability.
     """
     results = []
+    read_id_set = set(read_ids) if read_ids else None
+    read_id_order = {read_id: i for i, read_id in enumerate(read_ids or [])}
 
     _, index_dir = get_project_paths()
     index_path = os.path.join(index_dir, f"{os.path.basename(bam_path)}.bai")
 
     bam = pysam.AlignmentFile(bam_path, "rb", index_filename=index_path)
 
-    for read in bam.fetch(chrom, start, end):
+    for read in iter_candidate_reads(bam, chrom, start, end):
         if read.is_unmapped:
             continue
 
-        # Allow partial matching so users can provide either the full read ID or
-        # a unique substring from the read name.
+        # Allow partial matching for the single-ID mode so users can provide
+        # either the full read ID or a unique substring from the read name.
         if read_id_filter and read_id_filter not in read.query_name:
+            continue
+
+        if read_id_set is not None and read.query_name not in read_id_set:
             continue
 
         if not read.modified_bases:
@@ -234,7 +332,10 @@ def extract_brdu(bam_path, chrom, start, end, read_id_filter=None):
             for query_pos, raw_prob in mod_list:
                 ref_pos = aligned_pairs.get(query_pos)
 
-                if ref_pos is None or not (start <= ref_pos < end):
+                if ref_pos is None:
+                    continue
+
+                if start is not None and end is not None and not (start <= ref_pos < end):
                     continue
 
                 base = read.query_sequence[query_pos]
@@ -245,7 +346,7 @@ def extract_brdu(bam_path, chrom, start, end, read_id_filter=None):
                     continue
 
                 results.append((
-                    chrom,
+                    read.reference_name,
                     ref_pos,
                     ref_pos + 1,
                     read.query_name,
@@ -256,8 +357,12 @@ def extract_brdu(bam_path, chrom, start, end, read_id_filter=None):
     bam.close()
 
     # Sort by read ID and genomic position so each read's BrdU calls are grouped
-    # together in a stable order for downstream plotting.
-    results.sort(key=lambda x: (x[3], x[1]))
+    # together in a stable order for downstream plotting. When a ranked list is
+    # supplied, preserve that ranking in the downstream plot numbering.
+    if read_id_order:
+        results.sort(key=lambda x: (read_id_order.get(x[3], len(read_id_order)), x[1]))
+    else:
+        results.sort(key=lambda x: (x[3], x[1]))
     return results
 
 
@@ -274,6 +379,27 @@ def main():
     """
     args = parse_args()
 
+    if args.read_ids_file:
+        if any(value is not None for value in (args.chrom, args.start, args.end)):
+            if args.chrom is None or args.start is None or args.end is None:
+                print(
+                    "[ERROR] Provide --chrom, --start, and --end together, or omit all three "
+                    "when using --read_ids_file across the whole BAM.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+    else:
+        if args.chrom is None or args.start is None or args.end is None:
+            print(
+                "[ERROR] --chrom, --start, and --end are required unless --read_ids_file is provided.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+    if args.start is not None and args.end is not None and args.start >= args.end:
+        print("[ERROR] --start must be less than --end.", file=sys.stderr)
+        sys.exit(1)
+
     if not os.path.exists(args.bam):
         print(f"[ERROR] BAM not found: {args.bam}", file=sys.stderr)
         sys.exit(1)
@@ -283,7 +409,34 @@ def main():
     bam_path = check_and_sort_bam(args.bam, sorted_dir)
     check_and_index_bam(bam_path, index_dir)
 
-    results = extract_brdu(bam_path, args.chrom, args.start, args.end, args.read_id)
+    read_ids = None
+    if args.read_ids_file:
+        if not os.path.exists(args.read_ids_file):
+            print(f"[ERROR] Read IDs file not found: {args.read_ids_file}", file=sys.stderr)
+            sys.exit(1)
+
+        try:
+            read_ids = load_read_ids(
+                args.read_ids_file,
+                args.read_id_column,
+                args.read_ids_limit,
+            )
+        except ValueError as error:
+            print(f"[ERROR] {error}", file=sys.stderr)
+            sys.exit(1)
+        if not read_ids:
+            print(f"[ERROR] No read IDs found in {args.read_ids_file}", file=sys.stderr)
+            sys.exit(1)
+        print(f"[INFO] Loaded {len(read_ids)} read IDs from {args.read_ids_file}", file=sys.stderr)
+
+    results = extract_brdu(
+        bam_path,
+        args.chrom,
+        args.start,
+        args.end,
+        args.read_id,
+        read_ids,
+    )
 
     out = open(args.output, "w") if args.output else sys.stdout
 

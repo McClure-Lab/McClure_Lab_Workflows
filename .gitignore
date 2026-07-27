@@ -17,3 +17,5 @@ __pycache__
 # Ignore the .codex and .agents
 .codex
 .agents
+
+.vscode

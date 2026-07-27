@@ -8,7 +8,7 @@ set -euo pipefail
 
 # Display the expected command-line arguments for the alignment script.
 usage() {
-    echo "Usage: bash src/nanopore_sequence_workflow/minimap2_alignment.sh (--fastq FASTQ --reference FASTA | --input-bam BAM) --output-dir DIR --log-file LOG --preset PRESET --threads N --secondary yes|no --sort yes|no --index yes|no --min-mapq N --min-read-length N --primary-only yes|no"
+    echo "Usage: bash src/nanopore_sequence_workflow/minimap2_alignment.sh (--fastq FASTQ --reference FASTA | --input-bam BAM) --output-dir DIR --log-file LOG --preset PRESET --threads N --secondary yes|no --sort yes|no --index yes|no --min-mapq N --min-read-length N --primary-only yes|no [--append-log yes|no] [--log-label LABEL]"
 }
 
 # Initialize the required input paths.
@@ -17,6 +17,8 @@ INPUT_BAM=""
 REFERENCE=""
 OUTPUT_DIR=""
 LOG_FILE=""
+APPEND_LOG="no"
+LOG_LABEL=""
 
 # Initialize Minimap2, samtools, and filtering settings.
 #
@@ -121,6 +123,18 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
 
+        # Append to an existing log file instead of replacing it.
+        --append-log)
+            APPEND_LOG="$2"
+            shift 2
+            ;;
+
+        # Label this alignment block in a shared log file.
+        --log-label)
+            LOG_LABEL="$2"
+            shift 2
+            ;;
+
         # Display usage instructions and exit successfully.
         -h|--help)
             usage
@@ -145,6 +159,7 @@ INDEX_BAM="${INDEX_BAM:-yes}"
 MIN_MAPQ="${MIN_MAPQ:-20}"
 MIN_READ_LENGTH="${MIN_READ_LENGTH:-1000}"
 PRIMARY_ONLY="${PRIMARY_ONLY:-yes}"
+APPEND_LOG="${APPEND_LOG:-no}"
 
 # Confirm that all required file and directory arguments were provided.
 if [[ -z "$OUTPUT_DIR" || -z "$LOG_FILE" ]]; then
@@ -222,6 +237,16 @@ case "$PRIMARY_ONLY" in
     yes|no) ;;
     *)
         echo "[ERROR] Invalid --primary-only value: $PRIMARY_ONLY"
+        echo "[ERROR] Expected yes or no."
+        exit 1
+        ;;
+esac
+
+# Validate the log append option.
+case "$APPEND_LOG" in
+    yes|no) ;;
+    *)
+        echo "[ERROR] Invalid --append-log value: $APPEND_LOG"
         echo "[ERROR] Expected yes or no."
         exit 1
         ;;
@@ -317,8 +342,12 @@ if [[ "$PRIMARY_ONLY" == "yes" ]]; then
 fi
 
 # Write the complete alignment configuration to the main log file.
-{
+write_alignment_config() {
     echo "========================================="
+    if [[ -n "$LOG_LABEL" ]]; then
+        echo "  $LOG_LABEL"
+        echo "========================================="
+    fi
     if [[ -n "$INPUT_BAM" ]]; then
         echo "  DORADO BAM ALIGNMENT QC"
     else
@@ -342,11 +371,23 @@ fi
     echo "SLURM job ID:    ${SLURM_JOB_ID:-not_set}"
     echo "Output job ID:   $OUTPUT_JOB_ID"
     echo "========================================="
-} > "$LOG_FILE"
+}
+
+if [[ "$APPEND_LOG" == "yes" ]]; then
+    {
+        echo ""
+        write_alignment_config
+    } >> "$LOG_FILE"
+else
+    write_alignment_config > "$LOG_FILE"
+fi
 
 # Create the header of the separate QC report.
 echo "=========================================" > "$QC_REPORT"
 echo "  ALIGNMENT QC REPORT" >> "$QC_REPORT"
+if [[ -n "$LOG_LABEL" ]]; then
+    echo "  $LOG_LABEL" >> "$QC_REPORT"
+fi
 echo "  $(date)" >> "$QC_REPORT"
 echo "  Sample: $SAMPLE_PREFIX" >> "$QC_REPORT"
 echo "  Job ID: $OUTPUT_JOB_ID" >> "$QC_REPORT"
