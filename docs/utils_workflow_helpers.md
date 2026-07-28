@@ -194,7 +194,78 @@ Both scripts reduce a large modBAM to the reads that actually carry BrdU signal.
 That makes follow-up inspection, plotting, and targeted analysis faster and more
 focused.
 
-## 5. LiftOver BrdU BEDs for Rain Plots
+## 5. Rank Reads by Average BrdU Probability
+
+Scripts:
+
+```text
+src/utils/extract_wt_brdu.sh
+src/utils/rank_reads_by_average_brdu.py
+```
+
+Use these after creating a BrdU-positive BAM when you want to inspect which
+individual reads have the strongest BrdU incorporation signal.
+
+### `extract_wt_brdu.sh`
+
+This is a SLURM wrapper around `modkit extract full`. It takes a BrdU-positive
+BAM and writes a full Modkit extraction TSV containing the per-position BrdU
+probabilities and associated read/alignment information.
+
+What it does:
+
+- loads `modkit` and `samtools`
+- runs `modkit extract full`
+- keeps mapped reads only
+- uses the allocated SLURM CPU count for threading
+- writes a `.tsv` with BrdU probabilities and supporting read information
+- reports the final output size
+
+Example output naming:
+
+```text
+<sample>.Brdu_positive.threshold_0p5.extract.tsv
+```
+
+### `rank_reads_by_average_brdu.py`
+
+This Python helper reads the Modkit extraction TSV and sorts reads in
+descending order by their average BrdU probability. By default it keeps rows
+with modification code `b`, calculates each read's average `mod_qual`, and
+writes the highest-average BrdU reads first.
+
+What it does:
+
+- reads `.tsv` or `.tsv.gz` files produced by `modkit extract full`
+- processes large files in chunks
+- keeps rows matching the selected modification code
+- calculates per-read BrdU probability sums and evaluated BrdU positions
+- calculates each read's average BrdU probability
+- sorts reads from highest to lowest average BrdU probability
+- uses evaluated BrdU positions as a tie-breaker
+- writes a ranked TSV
+
+Example usage:
+
+```text
+python src/utils/rank_reads_by_average_brdu.py \
+    <sample>.Brdu_positive.threshold_0p5.extract.tsv
+```
+
+Example output naming:
+
+```text
+<sample>.Brdu_positive.threshold_0p5.extract.average_brdu_probability.sorted.tsv
+```
+
+How these help:
+
+Together, these utilities turn a BrdU-positive BAM into a per-read ranking so
+the reads with the highest apparent BrdU incorporation can be reviewed first.
+This is useful for finding high-incorporation reads for manual inspection,
+follow-up plotting, or targeted downstream analysis.
+
+## 6. LiftOver BrdU BEDs for Rain Plots
 
 Script:
 
@@ -222,7 +293,7 @@ from being corrupted during coordinate conversion.
 
 This script is called by the rain plot workflow when liftOver is requested.
 
-## 6. Further Points-of-Interest Analysis
+## 7. Further Points-of-Interest Analysis
 
 Scripts:
 
