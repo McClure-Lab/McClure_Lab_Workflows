@@ -228,6 +228,14 @@ usage() {
     echo "If arguments are omitted, the workflow prompts for inputs before submitting a SLURM job."
 }
 
+warn_unexpected_input() {
+    local received="$1"
+    local expected="$2"
+
+    echo "[WARN] Unexpected input: ${received:-<blank>}"
+    echo "[WARN] Expected input: $expected"
+}
+
 
 # ==============================================================================
 # FUNCTION: absolute_existing_file
@@ -1110,27 +1118,29 @@ submit_workflow() {
     # Select the input BAM file
     # --------------------------------------------------------------------------
 
-    if [[ -z "$bam_input" ]]; then
-        echo "[INFO] Available BAM files in $BAM_DIR:"
+    while true; do
+        if [[ -z "$bam_input" ]]; then
+            echo "[INFO] Available BAM files in $BAM_DIR:"
 
-        # List BAM files directly inside data/bam, sorted alphabetically.
-        find "$BAM_DIR" -maxdepth 1 -type f -name "*.bam" -printf "  %f\n" | sort
+            # List BAM files directly inside data/bam, sorted alphabetically.
+            find "$BAM_DIR" -maxdepth 1 -type f -name "*.bam" -printf "  %f\n" | sort
 
-        echo
-        read -r -p "Enter the BAM filename from data/bam: " bam_input
-    fi
+            echo
+            read -r -p "Enter the BAM filename from data/bam: " bam_input
+        fi
 
-    # Reject a blank BAM selection.
-    if [[ -z "$bam_input" ]]; then
-        echo "[ERROR] No BAM file was provided."
-        exit 1
-    fi
+        if [[ -z "$bam_input" ]]; then
+            warn_unexpected_input "$bam_input" "a BAM filename under $BAM_DIR, for example sample.bam"
+            continue
+        fi
 
-    # Resolve the BAM only under workflow_root/data/bam.
-    if ! bam_path="$(resolve_bam_file "$bam_input")"; then
-        echo "[ERROR] BAM file not found under $BAM_DIR: $(basename "$bam_input")"
-        exit 1
-    fi
+        if bam_path="$(resolve_bam_file "$bam_input")"; then
+            break
+        fi
+
+        warn_unexpected_input "$bam_input" "an existing BAM filename under $BAM_DIR, for example sample.bam"
+        bam_input=""
+    done
 
     # --------------------------------------------------------------------------
     # Determine the base output prefix
@@ -1156,13 +1166,16 @@ submit_workflow() {
     #
     # Pressing Enter accepts DEFAULT_REF.
     #
-    read -r -p "Reference FASTA for modkit pileup [$DEFAULT_REF]: " ref_input
-    ref_input="${ref_input:-$DEFAULT_REF}"
+    while true; do
+        read -r -p "Reference FASTA for modkit pileup [$DEFAULT_REF]: " ref_input
+        ref_input="${ref_input:-$DEFAULT_REF}"
 
-    if ! reference="$(resolve_reference_file "$ref_input")"; then
-        echo "[ERROR] Reference FASTA not found: $ref_input"
-        exit 1
-    fi
+        if reference="$(resolve_reference_file "$ref_input")"; then
+            break
+        fi
+
+        warn_unexpected_input "$ref_input" "an existing FASTA path, for example $DEFAULT_REF"
+    done
 
     # --------------------------------------------------------------------------
     # Select and validate the Modkit threshold
@@ -1171,16 +1184,19 @@ submit_workflow() {
     # The default threshold is 0.5. This can also be supplied as the third
     # positional argument to avoid the threshold prompt.
     #
-    if [[ -z "$mod_threshold_input" ]]; then
-        read -r -p "Modkit mod threshold [0.5]: " mod_threshold_input
-        mod_threshold_input="${mod_threshold_input:-0.5}"
-    fi
+    while true; do
+        if [[ -z "$mod_threshold_input" ]]; then
+            read -r -p "Modkit mod threshold [0.5]: " mod_threshold_input
+            mod_threshold_input="${mod_threshold_input:-0.5}"
+        fi
 
-    if ! mod_threshold="$(normalize_mod_threshold "$mod_threshold_input")"; then
-        echo "[ERROR] Invalid mod threshold: $mod_threshold_input"
-        echo "[ERROR] Expected a number from 0 to 1, for example 0.5 or 0.6."
-        exit 1
-    fi
+        if mod_threshold="$(normalize_mod_threshold "$mod_threshold_input")"; then
+            break
+        fi
+
+        warn_unexpected_input "$mod_threshold_input" "a number from 0 to 1, for example 0.5 or 0.6"
+        mod_threshold_input=""
+    done
 
     # Add a filename suffix for nondefault thresholds.
     threshold_suffix="$(mod_threshold_suffix "$mod_threshold")"
@@ -1196,13 +1212,15 @@ submit_workflow() {
     echo "Choose cell-cycle phase for genome browser plot titles:"
     echo "  M) Mitosis"
     echo "  S) S Phase"
-    read -r -p "Enter M or S: " phase_input
+    while true; do
+        read -r -p "Enter M or S: " phase_input
 
-    if ! phase_label="$(normalize_phase_label "$phase_input")"; then
-        echo "[ERROR] Invalid phase: $phase_input"
-        echo "[ERROR] Expected M or S."
-        exit 1
-    fi
+        if phase_label="$(normalize_phase_label "$phase_input")"; then
+            break
+        fi
+
+        warn_unexpected_input "$phase_input" "M or S, for example M"
+    done
 
     # --------------------------------------------------------------------------
     # Select the plot-generation mode
@@ -1214,14 +1232,16 @@ submit_workflow() {
     echo "Choose genome browser output mode:"
     echo "  1) smoothed"
     echo "  2) unsmoothed"
-    read -r -p "Enter smoothed or unsmoothed [smoothed]: " plot_mode_input
-    plot_mode_input="${plot_mode_input:-smoothed}"
+    while true; do
+        read -r -p "Enter smoothed or unsmoothed [smoothed]: " plot_mode_input
+        plot_mode_input="${plot_mode_input:-smoothed}"
 
-    if ! plot_mode="$(normalize_plot_mode "$plot_mode_input")"; then
-        echo "[ERROR] Invalid mode: $plot_mode_input"
-        echo "[ERROR] Expected smoothed or unsmoothed."
-        exit 1
-    fi
+        if plot_mode="$(normalize_plot_mode "$plot_mode_input")"; then
+            break
+        fi
+
+        warn_unexpected_input "$plot_mode_input" "smoothed or unsmoothed, for example smoothed"
+    done
 
     # Determine where the selected plot type will be written.
     mode_results_dir="$RESULTS_DIR/$plot_mode"

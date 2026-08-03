@@ -205,6 +205,22 @@ prompt_with_default() {
     printf '%s\n' "${value:-$default}"
 }
 
+warn_unexpected_input() {
+    local received="$1"
+    local expected="$2"
+
+    echo "[WARN] Unexpected input: ${received:-<blank>}"
+    echo "[WARN] Expected input: $expected"
+}
+
+is_positive_int() {
+    [[ "$1" =~ ^[1-9][0-9]*$ ]]
+}
+
+is_nonnegative_int() {
+    [[ "$1" =~ ^[0-9]+$ ]]
+}
+
 # Confirm that a value is a positive integer greater than zero.
 validate_positive_int() {
     local name="$1"
@@ -580,25 +596,26 @@ submit_workflow() {
 
     # When the BAM was not provided as an argument, display available
     # BAM files and prompt the user to select one.
-    if [[ -z "$bam_input" ]]; then
-        echo "[INFO] Available BAM files in $BAM_DIR:"
-        find "$BAM_DIR" -maxdepth 1 -type f -name "*.bam" -printf "  %f\n" | sort
-        echo
-        read -r -p "Enter BAM filename from data/bam or an explicit path: " bam_input
-    fi
+    while true; do
+        if [[ -z "$bam_input" ]]; then
+            echo "[INFO] Available BAM files in $BAM_DIR:"
+            find "$BAM_DIR" -maxdepth 1 -type f -name "*.bam" -printf "  %f\n" | sort
+            echo
+            read -r -p "Enter BAM filename from data/bam or an explicit path: " bam_input
+        fi
 
-    # Stop if the user did not provide a BAM.
-    if [[ -z "$bam_input" ]]; then
-        echo "[ERROR] BAM file is required."
-        exit 1
-    fi
+        if [[ -z "$bam_input" ]]; then
+            warn_unexpected_input "$bam_input" "a BAM filename in $BAM_DIR or an explicit BAM path"
+            continue
+        fi
 
-    # Resolve the BAM to an absolute existing path.
-    if ! bam_file="$(resolve_bam_file "$bam_input")"; then
-        echo "[ERROR] BAM file not found: $bam_input"
-        echo "[ERROR] Expected a valid path or a filename in $BAM_DIR"
-        exit 1
-    fi
+        if bam_file="$(resolve_bam_file "$bam_input")"; then
+            break
+        fi
+
+        warn_unexpected_input "$bam_input" "a valid path or a filename in $BAM_DIR"
+        bam_input=""
+    done
 
     # Use BAM.bai as the default index path.
     #
@@ -607,76 +624,88 @@ submit_workflow() {
     default_bam_index="${bam_file}.bai"
 
     # Prompt for the BAM index when one was not supplied as an argument.
-    if [[ -z "$bam_index_input" ]]; then
-        bam_index_input="$(prompt_with_default "Enter BAM index filename from data/bam or an explicit path" "$default_bam_index")"
-    fi
+    while true; do
+        if [[ -z "$bam_index_input" ]]; then
+            bam_index_input="$(prompt_with_default "Enter BAM index filename from data/bam or an explicit path" "$default_bam_index")"
+        fi
+
+        if bam_index="$(resolve_bam_index_file "$bam_index_input")"; then
+            break
+        fi
+
+        warn_unexpected_input "$bam_index_input" "a valid BAM index path or a filename in $BAM_DIR, for example $(basename "$default_bam_index")"
+        bam_index_input=""
+    done
 
     # Display available FASTA files and prompt for the reference when
     # one was not supplied as an argument.
-    if [[ -z "$reference_input" ]]; then
-        echo "[INFO] Available reference FASTA files in $FASTQ_DIR:"
-        find "$FASTQ_DIR" -maxdepth 1 -type f \( -name "*.fa" -o -name "*.fasta" -o -name "*.fna" \) -printf "  %f\n" | sort
-        echo
-        read -r -p "Enter reference FASTA filename from data/fastq, data/, or an explicit path: " reference_input
-    fi
+    while true; do
+        if [[ -z "$reference_input" ]]; then
+            echo "[INFO] Available reference FASTA files in $FASTQ_DIR:"
+            find "$FASTQ_DIR" -maxdepth 1 -type f \( -name "*.fa" -o -name "*.fasta" -o -name "*.fna" \) -printf "  %f\n" | sort
+            echo
+            read -r -p "Enter reference FASTA filename from data/fastq, data/, or an explicit path: " reference_input
+        fi
+
+        if [[ -z "$reference_input" ]]; then
+            warn_unexpected_input "$reference_input" "a FASTA filename or path, for example reference.fna"
+            continue
+        fi
+
+        if reference="$(resolve_reference_file "$reference_input")"; then
+            break
+        fi
+
+        warn_unexpected_input "$reference_input" "a valid path, a filename in $FASTQ_DIR, or an exact filename under $WORKFLOW_ROOT/data"
+        reference_input=""
+    done
 
     # Display files in data/pod5 and prompt for the DNAscent index when
     # one was not supplied as an argument.
-    if [[ -z "$dnascent_index_input" ]]; then
-        echo "[INFO] Available DNAscent index files in $POD5_DIR:"
-        find "$POD5_DIR" -maxdepth 1 -type f -printf "  %f\n" | sort
-        echo
-        read -r -p "Enter DNAscent index filename from data/pod5 or an explicit path: " dnascent_index_input
-    fi
+    while true; do
+        if [[ -z "$dnascent_index_input" ]]; then
+            echo "[INFO] Available DNAscent index files in $POD5_DIR:"
+            find "$POD5_DIR" -maxdepth 1 -type f -printf "  %f\n" | sort
+            echo
+            read -r -p "Enter DNAscent index filename from data/pod5 or an explicit path: " dnascent_index_input
+        fi
+
+        if [[ -z "$dnascent_index_input" ]]; then
+            warn_unexpected_input "$dnascent_index_input" "a DNAscent index filename in $POD5_DIR or an explicit path"
+            continue
+        fi
+
+        if dnascent_index="$(resolve_dnascent_index_file "$dnascent_index_input")"; then
+            break
+        fi
+
+        warn_unexpected_input "$dnascent_index_input" "a valid path or a filename in $POD5_DIR"
+        dnascent_index_input=""
+    done
 
     # Display available POD5 files/directories and prompt for the raw signal input
     # when one was not supplied as an argument.
-    if [[ -z "$pod5_input" ]]; then
-        echo "[INFO] Available POD5 files and directories in $POD5_DIR:"
-        find "$POD5_DIR" -maxdepth 1 -type f -name "*.pod5" -printf "  %f\n" | sort
-        find "$POD5_DIR" -mindepth 1 -maxdepth 1 -type d -printf "  %f/\n" | sort
-        echo
-        read -r -p "Enter POD5 file/directory from data/pod5 or an explicit path: " pod5_input
-    fi
+    while true; do
+        if [[ -z "$pod5_input" ]]; then
+            echo "[INFO] Available POD5 files and directories in $POD5_DIR:"
+            find "$POD5_DIR" -maxdepth 1 -type f -name "*.pod5" -printf "  %f\n" | sort
+            find "$POD5_DIR" -mindepth 1 -maxdepth 1 -type d -printf "  %f/\n" | sort
+            echo
+            read -r -p "Enter POD5 file/directory from data/pod5 or an explicit path: " pod5_input
+        fi
 
-    # Confirm that all required input values were provided.
-    if [[ -z "$bam_index_input" || -z "$reference_input" || -z "$dnascent_index_input" || -z "$pod5_input" ]]; then
-        echo "[ERROR] BAM index, reference FASTA, DNAscent index, and POD5 are required."
-        exit 1
-    fi
+        if [[ -z "$pod5_input" ]]; then
+            warn_unexpected_input "$pod5_input" "a .pod5 file, a directory containing .pod5 files, or a name in $POD5_DIR"
+            continue
+        fi
 
-    # Resolve the BAM index to an absolute existing path.
-    if ! bam_index="$(resolve_bam_index_file "$bam_index_input")"; then
-        echo "[ERROR] BAM index not found: $bam_index_input"
-        echo "[ERROR] Expected a valid path or a filename in $BAM_DIR"
-        exit 1
-    fi
+        if pod5_file="$(resolve_pod5_path "$pod5_input")" && pod5_input_has_reads "$pod5_file"; then
+            break
+        fi
 
-    # Resolve the reference FASTA to an absolute existing path.
-    if ! reference="$(resolve_reference_file "$reference_input")"; then
-        echo "[ERROR] Reference FASTA not found: $reference_input"
-        echo "[ERROR] Expected a valid path, a filename in $FASTQ_DIR, or an exact filename under $WORKFLOW_ROOT/data"
-        exit 1
-    fi
-
-    # Resolve the DNAscent index to an absolute existing path.
-    if ! dnascent_index="$(resolve_dnascent_index_file "$dnascent_index_input")"; then
-        echo "[ERROR] DNAscent index not found: $dnascent_index_input"
-        echo "[ERROR] Expected a valid path or a filename in $POD5_DIR"
-        exit 1
-    fi
-
-    # Resolve the POD5 input to an absolute existing file or directory path.
-    if ! pod5_file="$(resolve_pod5_path "$pod5_input")"; then
-        echo "[ERROR] POD5 input not found: $pod5_input"
-        echo "[ERROR] Expected a valid .pod5 file/directory or a name in $POD5_DIR"
-        exit 1
-    fi
-
-    if ! pod5_input_has_reads "$pod5_file"; then
-        echo "[ERROR] POD5 input must be a .pod5 file or a directory containing .pod5 files: $pod5_file"
-        exit 1
-    fi
+        warn_unexpected_input "$pod5_input" "a valid .pod5 file/directory or a name in $POD5_DIR"
+        pod5_input=""
+    done
 
     # Derive the output prefix from the BAM name.
     bam_basename="$(basename "$bam_file")"
@@ -690,26 +719,43 @@ submit_workflow() {
 
     # Collect the DNAscent container and runtime parameters.
     # The values in brackets are used when the user presses Enter.
-    dnascent_image="$(prompt_with_default "Enter DNAscent container image path" "$DEFAULT_DNASCENT_IMAGE")"
-    threads="$(prompt_with_default "Enter DNAscent threads / SLURM cpus-per-task" "12")"
-    gpu="$(prompt_with_default "Enter DNAscent --GPU value" "0")"
-    min_qscore="$(prompt_with_default "Enter DNAscent -q minimum alignment/read quality" "20")"
-    min_read_length="$(prompt_with_default "Enter DNAscent -l minimum read length" "1000")"
+    while true; do
+        dnascent_image="$(prompt_with_default "Enter DNAscent container image path" "$DEFAULT_DNASCENT_IMAGE")"
+        if [[ -f "$dnascent_image" ]]; then
+            break
+        fi
+        warn_unexpected_input "$dnascent_image" "an existing DNAscent container image path, for example $DEFAULT_DNASCENT_IMAGE"
+    done
+    while true; do
+        threads="$(prompt_with_default "Enter DNAscent threads / SLURM cpus-per-task" "12")"
+        if is_positive_int "$threads"; then
+            break
+        fi
+        warn_unexpected_input "$threads" "a positive integer, for example 12"
+    done
+    while true; do
+        gpu="$(prompt_with_default "Enter DNAscent --GPU value" "0")"
+        if is_nonnegative_int "$gpu"; then
+            break
+        fi
+        warn_unexpected_input "$gpu" "a non-negative integer, for example 0"
+    done
+    while true; do
+        min_qscore="$(prompt_with_default "Enter DNAscent -q minimum alignment/read quality" "20")"
+        if is_nonnegative_int "$min_qscore"; then
+            break
+        fi
+        warn_unexpected_input "$min_qscore" "a non-negative integer, for example 20"
+    done
+    while true; do
+        min_read_length="$(prompt_with_default "Enter DNAscent -l minimum read length" "1000")"
+        if is_positive_int "$min_read_length"; then
+            break
+        fi
+        warn_unexpected_input "$min_read_length" "a positive integer, for example 1000"
+    done
     slurm_mem="$(prompt_with_default "Enter SLURM memory" "36G")"
     slurm_time="$(prompt_with_default "Enter SLURM time" "12:00:00")"
-
-    # Validate the parameters that must be numeric.
-    validate_positive_int "--threads" "$threads"
-    validate_nonnegative_int "--GPU" "$gpu"
-    validate_nonnegative_int "-q" "$min_qscore"
-    validate_positive_int "-l" "$min_read_length"
-
-    # Confirm that the selected DNAscent container exists before
-    # submitting the job.
-    if [[ ! -f "$dnascent_image" ]]; then
-        echo "[ERROR] DNAscent container image not found: $dnascent_image"
-        exit 1
-    fi
 
     # Display all resolved inputs and the expected output path.
     echo

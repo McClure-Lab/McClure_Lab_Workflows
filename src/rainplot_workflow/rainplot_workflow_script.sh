@@ -254,6 +254,14 @@ usage() {
   echo "Rainplot read count is prompted interactively; blank plots all reads in the region."
 }
 
+warn_unexpected_input() {
+  local received="$1"
+  local expected="$2"
+
+  echo "[WARN] Unexpected input: ${received:-<blank>}"
+  echo "[WARN] Expected input: $expected"
+}
+
 
 # ==============================================================================
 # FUNCTION: absolute_existing_file
@@ -1681,54 +1689,64 @@ submit_workflow() {
   # Select and validate the BAM file
   # ---------------------------------------------------------------------------
 
-  if [[ -z "$bam_input" ]]; then
-    echo "[INFO] Available BAM files in $BAM_DIR:"
+  while true; do
+    if [[ -z "$bam_input" ]]; then
+      echo "[INFO] Available BAM files in $BAM_DIR:"
 
-    find "$BAM_DIR" \
-      -maxdepth 1 \
-      -type f \
-      -name "*.bam" \
-      -printf "  %f\n" |
-      sort
+      find "$BAM_DIR" \
+        -maxdepth 1 \
+        -type f \
+        -name "*.bam" \
+        -printf "  %f\n" |
+        sort
 
-    echo
+      echo
 
-    read -r -p "Enter the BAM filename from data/bam: " bam_input
-  fi
+      read -r -p "Enter the BAM filename from data/bam: " bam_input
+    fi
 
-  if [[ -z "$bam_input" ]]; then
-    echo "[ERROR] No BAM file was provided."
-    exit 1
-  fi
+    if [[ -z "$bam_input" ]]; then
+      warn_unexpected_input "$bam_input" "a BAM filename under $BAM_DIR, for example sample.bam"
+      continue
+    fi
 
-  if ! bam_path="$(resolve_bam_file "$bam_input")"; then
-    echo "[ERROR] BAM file not found under $BAM_DIR: $(basename "$bam_input")"
-    exit 1
-  fi
+    if bam_path="$(resolve_bam_file "$bam_input")"; then
+      break
+    fi
+
+    warn_unexpected_input "$bam_input" "an existing BAM filename under $BAM_DIR, for example sample.bam"
+    bam_input=""
+  done
 
   # ---------------------------------------------------------------------------
   # Optionally select a TSV/list containing read IDs
   # ---------------------------------------------------------------------------
 
-  if [[ -z "$read_ids_file_input" ]]; then
-    read -r -p "Enter read IDs TSV/list file [blank for none]: " read_ids_file_input
-  fi
-
-  # A single read ID and a read IDs file cannot both control selection.
-  if [[ -n "$read_id" && -n "$read_ids_file_input" ]]; then
-    echo "[ERROR] Use either a single read ID or a read IDs file, not both."
-    exit 1
-  fi
-
-  if [[ -n "$read_ids_file_input" ]]; then
-    if [[ ! -f "$read_ids_file_input" ]]; then
-      echo "[ERROR] Read IDs file not found: $read_ids_file_input"
-      exit 1
+  while true; do
+    if [[ -z "$read_ids_file_input" ]]; then
+      read -r -p "Enter read IDs TSV/list file [blank for none]: " read_ids_file_input
     fi
 
-    read_ids_file="$(absolute_existing_file "$read_ids_file_input")"
-    uses_read_ids_file="yes"
-  fi
+    # A single read ID and a read IDs file cannot both control selection.
+    if [[ -n "$read_id" && -n "$read_ids_file_input" ]]; then
+      warn_unexpected_input "$read_ids_file_input" "blank because a single read ID was already supplied"
+      read_ids_file_input=""
+      continue
+    fi
+
+    if [[ -z "$read_ids_file_input" ]]; then
+      break
+    fi
+
+    if [[ -f "$read_ids_file_input" ]]; then
+      read_ids_file="$(absolute_existing_file "$read_ids_file_input")"
+      uses_read_ids_file="yes"
+      break
+    fi
+
+    warn_unexpected_input "$read_ids_file_input" "an existing TSV/list file path, or blank for none"
+    read_ids_file_input=""
+  done
 
   # ---------------------------------------------------------------------------
   # Select binary or mean BrdU T-window processing
@@ -1748,7 +1766,7 @@ submit_workflow() {
       break
     fi
 
-    echo "[WARN] Invalid response. Please enter binary or mean."
+    warn_unexpected_input "$brdu_window_mode_input" "binary or mean, for example binary"
   done
 
   # Binary mode requires a BrdU probability threshold.
@@ -1764,7 +1782,7 @@ submit_workflow() {
         break
       fi
 
-      echo "[WARN] Invalid threshold. Please enter a number from 0 to 1."
+      warn_unexpected_input "$binary_threshold_input" "a number from 0 to 1, for example 0.5"
     done
   fi
 
@@ -1773,17 +1791,26 @@ submit_workflow() {
   # ---------------------------------------------------------------------------
 
   if [[ "$uses_read_ids_file" == "no" ]]; then
-    if [[ -z "$chrom" ]]; then
+    while [[ -z "$chrom" ]]; do
       read -r -p "Enter chromosome GenBank ID: " chrom
-    fi
+      if [[ -z "$chrom" ]]; then
+        warn_unexpected_input "$chrom" "a chromosome ID, for example CM007964.1 or chr1"
+      fi
+    done
 
-    if [[ -z "$start" ]]; then
+    while [[ -z "$start" || ! "$start" =~ ^[0-9]+$ ]]; do
+      if [[ -n "$start" ]]; then
+        warn_unexpected_input "$start" "an integer start coordinate, for example 10000"
+      fi
       read -r -p "Enter start coordinate: " start
-    fi
+    done
 
-    if [[ -z "$end" ]]; then
+    while [[ -z "$end" || ! "$end" =~ ^[0-9]+$ ]]; do
+      if [[ -n "$end" ]]; then
+        warn_unexpected_input "$end" "an integer end coordinate greater than the start, for example 50000"
+      fi
       read -r -p "Enter end coordinate: " end
-    fi
+    done
   else
     # A read IDs file may contain reads from multiple intervals. Clear region
     # fields so downstream scripts process all coordinates associated with the
@@ -1814,7 +1841,7 @@ submit_workflow() {
       break
     fi
 
-    echo "[WARN] Invalid read count. Please enter a positive integer, or leave blank for all reads."
+    warn_unexpected_input "$max_reads_input" "a positive integer, for example 25, or blank for all reads"
   done
 
   # ---------------------------------------------------------------------------
@@ -1822,15 +1849,19 @@ submit_workflow() {
   # ---------------------------------------------------------------------------
 
   if [[ "$uses_read_ids_file" == "no" ]]; then
-    if [[ ! "$start" =~ ^[0-9]+$ || ! "$end" =~ ^[0-9]+$ ]]; then
-      echo "[ERROR] Start and end coordinates must be integers."
-      exit 1
-    fi
-
-    if (( start >= end )); then
-      echo "[ERROR] Start coordinate must be less than end coordinate."
-      exit 1
-    fi
+    while (( start >= end )); do
+      warn_unexpected_input "$start-$end" "a start coordinate less than the end coordinate, for example 10000 then 50000"
+      read -r -p "Enter start coordinate: " start
+      while [[ -z "$start" || ! "$start" =~ ^[0-9]+$ ]]; do
+        warn_unexpected_input "$start" "an integer start coordinate, for example 10000"
+        read -r -p "Enter start coordinate: " start
+      done
+      read -r -p "Enter end coordinate: " end
+      while [[ -z "$end" || ! "$end" =~ ^[0-9]+$ ]]; do
+        warn_unexpected_input "$end" "an integer end coordinate greater than the start, for example 50000"
+        read -r -p "Enter end coordinate: " end
+      done
+    done
   fi
 
   # ---------------------------------------------------------------------------
@@ -1876,7 +1907,7 @@ submit_workflow() {
       break
     fi
 
-    echo "[WARN] Invalid response. Please enter M or S."
+    warn_unexpected_input "$phase_input" "M or S, for example S"
   done
 
   # ---------------------------------------------------------------------------
@@ -1924,7 +1955,7 @@ submit_workflow() {
           break
           ;;
         *)
-          echo "[WARN] Invalid response. Please enter a, b, or c."
+          warn_unexpected_input "$s_phase_plot_choice" "a, b, or c"
           ;;
       esac
     done
@@ -1948,21 +1979,20 @@ submit_workflow() {
             sacCer1|sacCer2|sacCer3)
               # Validate that the required chain file exists.
               if ! resolve_liftover_chain "$target_strain" >/dev/null; then
-                echo "[WARN] No chain file found for target strain $target_strain in $CHAIN_DIR"
-                echo "[WARN] Expected W303TosacCer${target_strain#sacCer}.over.chain.gz"
+                warn_unexpected_input "$target_strain" "a target with chain file W303TosacCer${target_strain#sacCer}.over.chain.gz in $CHAIN_DIR"
                 continue
               fi
 
               # Validate the target annotation file.
               if [[ ! -s "$(resolve_annotation_file "$target_strain" || true)" ]]; then
-                echo "[WARN] Annotation file not found for target strain $target_strain"
+                warn_unexpected_input "$target_strain" "a target strain with an available annotation file"
                 continue
               fi
 
               break
               ;;
             *)
-              echo "[WARN] Invalid strain. Please enter sacCer1, sacCer2, or sacCer3."
+              warn_unexpected_input "$target_strain" "sacCer1, sacCer2, or sacCer3"
               ;;
           esac
         done
@@ -1974,7 +2004,7 @@ submit_workflow() {
         break
         ;;
       *)
-        echo "[WARN] Invalid response. Please enter 'y' or 'n'."
+        warn_unexpected_input "$do_liftover" "y or n"
         ;;
     esac
   done

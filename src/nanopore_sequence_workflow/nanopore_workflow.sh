@@ -198,6 +198,33 @@ prompt_optional() {
     printf '%s\n' "$value"
 }
 
+warn_unexpected_input() {
+    local received="$1"
+    local expected="$2"
+
+    echo "[WARN] Unexpected input: ${received:-<blank>}"
+    echo "[WARN] Expected input: $expected"
+}
+
+is_yes_no() {
+    case "$1" in
+        yes|no) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+is_optional_positive_integer() {
+    [[ -z "$1" || "$1" =~ ^[1-9][0-9]*$ ]]
+}
+
+is_positive_integer() {
+    [[ "$1" =~ ^[1-9][0-9]*$ ]]
+}
+
+is_nonnegative_integer() {
+    [[ "$1" =~ ^[0-9]+$ ]]
+}
+
 # Validate options that must be exactly yes or no.
 validate_yes_no() {
     local name="$1"
@@ -640,30 +667,56 @@ submit_workflow() {
 
     # When no POD5 was provided as a positional argument, display the
     # available POD5 files/directories and prompt the user to select one.
-    if [[ -z "$pod5_input" ]]; then
-        echo "[INFO] Available POD5 files and directories in $POD5_DIR:"
-        find "$POD5_DIR" -maxdepth 1 -type f -name "*.pod5" -printf "  %f\n" | sort
-        find "$POD5_DIR" -mindepth 1 -maxdepth 1 -type d -printf "  %f/\n" | sort
-        echo
-        read -r -p "Enter POD5 file/directory from data/pod5 or an explicit path: " pod5_input
-    fi
+    while true; do
+        if [[ -z "$pod5_input" ]]; then
+            echo "[INFO] Available POD5 files and directories in $POD5_DIR:"
+            find "$POD5_DIR" -maxdepth 1 -type f -name "*.pod5" -printf "  %f\n" | sort
+            find "$POD5_DIR" -mindepth 1 -maxdepth 1 -type d -printf "  %f/\n" | sort
+            echo
+            read -r -p "Enter POD5 file/directory from data/pod5 or an explicit path: " pod5_input
+        fi
+
+        if [[ -z "$pod5_input" ]]; then
+            warn_unexpected_input "$pod5_input" "a .pod5 file, a directory containing .pod5 files, or a name in $POD5_DIR"
+            continue
+        fi
+
+        if pod5="$(resolve_pod5_path "$pod5_input")" && pod5_input_has_reads "$pod5"; then
+            break
+        fi
+
+        warn_unexpected_input "$pod5_input" "a valid .pod5 file/directory or a name in $POD5_DIR"
+        pod5_input=""
+    done
 
     # Prompt for the reference FASTA when it was not supplied.
-    if [[ -z "$reference_input" ]]; then
-        read -r -p "Enter reference FASTA filename from data/fastq, data/, or an explicit path: " reference_input
-    fi
+    while true; do
+        if [[ -z "$reference_input" ]]; then
+            read -r -p "Enter reference FASTA filename from data/fastq, data/, or an explicit path: " reference_input
+        fi
+
+        if [[ -z "$reference_input" ]]; then
+            warn_unexpected_input "$reference_input" "a FASTA filename or path, for example reference.fna"
+            continue
+        fi
+
+        if reference="$(resolve_reference_file "$reference_input")"; then
+            break
+        fi
+
+        warn_unexpected_input "$reference_input" "a valid path, a filename in $DEFAULT_FASTQ_DIR, or an exact filename under $WORKFLOW_ROOT/data"
+        reference_input=""
+    done
 
     echo
     echo "Dorado output selection"
-    output_format="$(prompt_with_default "Should Dorado produce fastq or bam?" "bam")"
-
-    case "$output_format" in
-        fastq|bam) ;;
-        *)
-            echo "[ERROR] Dorado output must be fastq or bam."
-            exit 1
-            ;;
-    esac
+    while true; do
+        output_format="$(prompt_with_default "Should Dorado produce fastq or bam?" "bam")"
+        case "$output_format" in
+            fastq|bam) break ;;
+            *) warn_unexpected_input "$output_format" "fastq or bam, for example bam" ;;
+        esac
+    done
 
     # Prompt for the FASTQ output directory only when FASTQ is selected.
     if [[ "$output_format" == "fastq" && -z "$fastq_output_input" ]]; then
@@ -677,40 +730,24 @@ submit_workflow() {
         bam_output_input="$(prompt_with_default "Enter BAM output directory under data/" "$DEFAULT_BAM_DIR")"
     fi
 
-    # Confirm that both primary input files were provided.
-    if [[ -z "$pod5_input" || -z "$reference_input" ]]; then
-        echo "[ERROR] POD5 and reference FASTA are required."
-        exit 1
-    fi
-
-    # Resolve the POD5 input to an absolute existing file or directory path.
-    if ! pod5="$(resolve_pod5_path "$pod5_input")"; then
-        echo "[ERROR] POD5 input not found: $pod5_input"
-        echo "[ERROR] Expected a valid .pod5 file/directory or a name in $POD5_DIR"
-        exit 1
-    fi
-
-    if ! pod5_input_has_reads "$pod5"; then
-        echo "[ERROR] POD5 input must be a .pod5 file or a directory containing .pod5 files: $pod5"
-        exit 1
-    fi
-
-    # Resolve the reference FASTA to an absolute existing path.
-    if ! reference="$(resolve_reference_file "$reference_input")"; then
-        echo "[ERROR] Reference FASTA not found: $reference_input"
-        echo "[ERROR] Expected a valid path, a filename in $DEFAULT_FASTQ_DIR, or an exact filename under $WORKFLOW_ROOT/data"
-        exit 1
-    fi
-
     # Convert the supplied output-directory values into complete paths.
-    fastq_output_dir="$(resolve_data_output_dir "$fastq_output_input")"
-    bam_output_dir="$(resolve_data_output_dir "$bam_output_input")"
+    while true; do
+        fastq_output_dir="$(resolve_data_output_dir "$fastq_output_input")"
+        if [[ "$output_format" != "fastq" || "$fastq_output_dir" == "$WORKFLOW_ROOT/data"/* ]]; then
+            break
+        fi
+        warn_unexpected_input "$fastq_output_input" "a FASTQ output directory under $WORKFLOW_ROOT/data"
+        fastq_output_input="$(prompt_with_default "Enter FASTQ output directory under data/" "$DEFAULT_FASTQ_DIR")"
+    done
 
-    # Confirm that the selected output paths remain under WORKFLOW_ROOT/data.
-    if [[ "$output_format" == "fastq" ]]; then
-        validate_data_output_dir "FASTQ output directory" "$fastq_output_dir"
-    fi
-    validate_data_output_dir "BAM output directory" "$bam_output_dir"
+    while true; do
+        bam_output_dir="$(resolve_data_output_dir "$bam_output_input")"
+        if [[ "$bam_output_dir" == "$WORKFLOW_ROOT/data"/* ]]; then
+            break
+        fi
+        warn_unexpected_input "$bam_output_input" "a BAM output directory under $WORKFLOW_ROOT/data"
+        bam_output_input="$(prompt_with_default "Enter BAM output directory under data/" "$DEFAULT_BAM_DIR")"
+    done
 
     # Derive the sample prefix from the POD5 file or directory name.
     pod5_basename="$(basename "$pod5")"
@@ -722,20 +759,24 @@ submit_workflow() {
     # Ask about Dorado demux before collecting the rest of the
     # basecalling parameters so the barcode kit can be supplied to
     # basecalling for barcode classification.
-    run_demux="$(prompt_with_default "Run dorado demux after basecalling? (yes or no)" "no")"
-    validate_yes_no "dorado demux" "$run_demux"
+    while true; do
+        run_demux="$(prompt_with_default "Run dorado demux after basecalling? (yes or no)" "no")"
+        if is_yes_no "$run_demux"; then
+            break
+        fi
+        warn_unexpected_input "$run_demux" "yes or no"
+    done
 
     barcode_mode="none"
     kit_name=""
     if [[ "$run_demux" == "yes" ]]; then
         barcode_mode="demux"
-        kit_name="$(prompt_optional "Enter barcode-kit / --kit-name")"
-    fi
-
-    # Require a sequencing-kit name for demultiplexing.
-    if [[ "$barcode_mode" == "demux" && -z "$kit_name" ]]; then
-        echo "[ERROR] --kit-name is required when dorado demux is selected."
-        exit 1
+        while [[ -z "$kit_name" ]]; do
+            kit_name="$(prompt_optional "Enter barcode-kit / --kit-name")"
+            if [[ -z "$kit_name" ]]; then
+                warn_unexpected_input "$kit_name" "a barcode kit name, for example SQK-NBD114-24"
+            fi
+        done
     fi
 
     echo
@@ -752,18 +793,34 @@ submit_workflow() {
     device="$(prompt_with_default "Enter --device" "cuda:0")"
 
     # Collect the minimum Dorado quality threshold.
-    min_qscore="$(prompt_with_default "Enter --min-qscore" "6")"
+    while true; do
+        min_qscore="$(prompt_with_default "Enter --min-qscore" "6")"
+        if is_nonnegative_integer "$min_qscore"; then
+            break
+        fi
+        warn_unexpected_input "$min_qscore" "a non-negative integer, for example 6"
+    done
 
     # Limit basecalling to the first N reads when supplied.
     #
     # Leaving this blank omits --max-reads so Dorado basecalls all reads.
-    max_reads="$(prompt_optional "Enter --max-reads (optional; press Enter to basecall all reads)")"
-    validate_optional_positive_integer "--max-reads" "$max_reads"
+    while true; do
+        max_reads="$(prompt_optional "Enter --max-reads (optional; press Enter to basecall all reads)")"
+        if is_optional_positive_integer "$max_reads"; then
+            break
+        fi
+        warn_unexpected_input "$max_reads" "a positive integer, for example 1000, or blank"
+    done
 
     # Move tables are retained by BAM output and are useful for
     # downstream signal-aware tools. FASTQ cannot store this metadata.
-    emit_moves="$(prompt_with_default "Enter --emit-moves (yes or no; BAM output only)" "yes")"
-    validate_yes_no "--emit-moves" "$emit_moves"
+    while true; do
+        emit_moves="$(prompt_with_default "Enter --emit-moves (yes or no; BAM output only)" "yes")"
+        if is_yes_no "$emit_moves"; then
+            break
+        fi
+        warn_unexpected_input "$emit_moves" "yes or no"
+    done
 
     if [[ "$output_format" == "fastq" ]]; then
         echo "[INFO] --emit-fastq is enabled because the FASTQ path uses Minimap2 alignment."
@@ -784,36 +841,64 @@ submit_workflow() {
     preset="$(prompt_with_default "Enter --preset" "map-ont")"
 
     # Collect the CPU thread count used by alignment and BAM sorting.
-    threads="$(prompt_with_default "Enter --threads" "8")"
+    while true; do
+        threads="$(prompt_with_default "Enter --threads" "8")"
+        if is_positive_integer "$threads"; then
+            break
+        fi
+        warn_unexpected_input "$threads" "a positive integer, for example 8"
+    done
 
     # Determine whether secondary alignments should be retained.
-    secondary="$(prompt_with_default "Enter --secondary (yes or no)" "no")"
+    while true; do
+        secondary="$(prompt_with_default "Enter --secondary (yes or no)" "no")"
+        if is_yes_no "$secondary"; then
+            break
+        fi
+        warn_unexpected_input "$secondary" "yes or no"
+    done
 
     # Sorting and indexing are required by the alignment QC steps.
-    sort_bam="$(prompt_with_default "Enter --sort (yes required for QC)" "yes")"
-    index_bam="$(prompt_with_default "Enter --index (yes required for QC)" "yes")"
+    while true; do
+        sort_bam="$(prompt_with_default "Enter --sort (yes required for QC)" "yes")"
+        if [[ "$sort_bam" == "yes" ]]; then
+            break
+        fi
+        warn_unexpected_input "$sort_bam" "yes because this workflow requires sorted BAM output for QC"
+    done
+    while true; do
+        index_bam="$(prompt_with_default "Enter --index (yes required for QC)" "yes")"
+        if [[ "$index_bam" == "yes" ]]; then
+            break
+        fi
+        warn_unexpected_input "$index_bam" "yes because this workflow requires indexed BAM output for QC"
+    done
 
     # Collect the mapping-quality and read-length thresholds used by QC.
-    min_mapq="$(prompt_with_default "Enter --min-mapq" "20")"
-    min_read_length="$(prompt_with_default "Enter --min-read-length" "1000")"
+    while true; do
+        min_mapq="$(prompt_with_default "Enter --min-mapq" "20")"
+        if is_nonnegative_integer "$min_mapq"; then
+            break
+        fi
+        warn_unexpected_input "$min_mapq" "a non-negative integer, for example 20"
+    done
+    while true; do
+        min_read_length="$(prompt_with_default "Enter --min-read-length" "1000")"
+        if is_positive_integer "$min_read_length"; then
+            break
+        fi
+        warn_unexpected_input "$min_read_length" "a positive integer, for example 1000"
+    done
 
     # Determine whether the output should be filtered to primary
     # alignments only during BAM creation.
-    primary_only="$(prompt_with_default "Enter --primary-only (yes or no)" "yes")"
-
-    # Validate all yes/no alignment parameters.
-    validate_yes_no "--secondary" "$secondary"
-    validate_yes_no "--sort" "$sort_bam"
-    validate_yes_no "--index" "$index_bam"
-    validate_yes_no "--primary-only" "$primary_only"
-
-    # Enforce sorting and indexing because the later QC checks rely
-    # on a coordinate-sorted, indexed BAM.
-    if [[ "$sort_bam" != "yes" || "$index_bam" != "yes" ]]; then
-        echo "[ERROR] This nanopore workflow requires --sort yes and --index yes."
-        echo "[ERROR] The requested coverage, MAPQ/read-length, and chromosome 12/rDNA checks run on the sorted indexed BAM."
-        exit 1
-    fi
+    while true; do
+        primary_only="$(prompt_with_default "Enter --primary-only (yes or no)" "yes")"
+        if is_yes_no "$primary_only"; then
+            break
+        fi
+        warn_unexpected_input "$primary_only" "yes or no"
+    done
 
     # Create the selected output directories.
     if [[ "$output_format" == "fastq" ]]; then
