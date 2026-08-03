@@ -298,15 +298,16 @@ absolute_existing_file() {
 # ==============================================================================
 #
 # Purpose:
-#   Resolve a BAM by filename under workflow_root/data/bam.
+#   Resolve a BAM from an explicit path or by filename under
+#   workflow_root/data/bam.
 #
 # Arguments:
 #   $1
 #       BAM filename or path supplied by the user.
 #
 # Behavior:
-#   Only the basename is used. Supplying a BAM path outside data/bam does not
-#   bypass the workflow's BAM-directory restriction.
+#   Explicit paths are used when they exist. Otherwise, the input is treated as
+#   a filename under workflow_root/data/bam.
 #
 # Output:
 #   Absolute BAM path when the file exists.
@@ -319,6 +320,11 @@ resolve_bam_file() {
   local bam_input="$1"
   local bam_filename
   local bam_path
+
+  if [[ -f "$bam_input" ]]; then
+    absolute_existing_file "$bam_input"
+    return 0
+  fi
 
   # Remove directory components from the supplied BAM value.
   bam_filename="$(basename "$bam_input")"
@@ -1691,7 +1697,7 @@ submit_workflow() {
 
   while true; do
     if [[ -z "$bam_input" ]]; then
-      echo "[INFO] Available BAM files in $BAM_DIR:"
+      echo "[INFO] Available BAM files in default path $BAM_DIR:"
 
       find "$BAM_DIR" \
         -maxdepth 1 \
@@ -1702,11 +1708,11 @@ submit_workflow() {
 
       echo
 
-      read -r -p "Enter the BAM filename from data/bam: " bam_input
+      read -r -p "Enter a BAM filename from data/bam, or an explicit path plus filename: " bam_input
     fi
 
     if [[ -z "$bam_input" ]]; then
-      warn_unexpected_input "$bam_input" "a BAM filename under $BAM_DIR, for example sample.bam"
+      warn_unexpected_input "$bam_input" "a BAM filename under $BAM_DIR, for example sample.bam, or an explicit path like /path/to/sample.bam"
       continue
     fi
 
@@ -1714,7 +1720,7 @@ submit_workflow() {
       break
     fi
 
-    warn_unexpected_input "$bam_input" "an existing BAM filename under $BAM_DIR, for example sample.bam"
+    warn_unexpected_input "$bam_input" "an existing BAM filename under $BAM_DIR, for example sample.bam, or an explicit path like /path/to/sample.bam"
     bam_input=""
   done
 
@@ -1724,7 +1730,10 @@ submit_workflow() {
 
   while true; do
     if [[ -z "$read_ids_file_input" ]]; then
-      read -r -p "Enter read IDs TSV/list file [blank for none]: " read_ids_file_input
+      echo "[INFO] Available read IDs/list files in default path $BED_DIR:"
+      find "$BED_DIR" -maxdepth 1 -type f -printf "  %f\n" | sort
+      echo
+      read -r -p "Enter a read IDs TSV/list filename from data/bed, an explicit path plus filename, or blank for none: " read_ids_file_input
     fi
 
     # A single read ID and a read IDs file cannot both control selection.
@@ -1744,7 +1753,13 @@ submit_workflow() {
       break
     fi
 
-    warn_unexpected_input "$read_ids_file_input" "an existing TSV/list file path, or blank for none"
+    if [[ -f "$BED_DIR/$(basename "$read_ids_file_input")" ]]; then
+      read_ids_file="$(absolute_existing_file "$BED_DIR/$(basename "$read_ids_file_input")")"
+      uses_read_ids_file="yes"
+      break
+    fi
+
+    warn_unexpected_input "$read_ids_file_input" "a TSV/list filename under $BED_DIR, an explicit path like /path/to/read_ids.tsv, or blank for none"
     read_ids_file_input=""
   done
 

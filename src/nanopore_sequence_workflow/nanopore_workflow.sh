@@ -669,15 +669,15 @@ submit_workflow() {
     # available POD5 files/directories and prompt the user to select one.
     while true; do
         if [[ -z "$pod5_input" ]]; then
-            echo "[INFO] Available POD5 files and directories in $POD5_DIR:"
+            echo "[INFO] Available POD5 files and directories in default path $POD5_DIR:"
             find "$POD5_DIR" -maxdepth 1 -type f -name "*.pod5" -printf "  %f\n" | sort
             find "$POD5_DIR" -mindepth 1 -maxdepth 1 -type d -printf "  %f/\n" | sort
             echo
-            read -r -p "Enter POD5 file/directory from data/pod5 or an explicit path: " pod5_input
+            read -r -p "Enter a POD5 file/directory from data/pod5, or an explicit path plus file/directory: " pod5_input
         fi
 
         if [[ -z "$pod5_input" ]]; then
-            warn_unexpected_input "$pod5_input" "a .pod5 file, a directory containing .pod5 files, or a name in $POD5_DIR"
+            warn_unexpected_input "$pod5_input" "a .pod5 file or directory in $POD5_DIR, or an explicit path like /path/to/sample.pod5"
             continue
         fi
 
@@ -685,18 +685,26 @@ submit_workflow() {
             break
         fi
 
-        warn_unexpected_input "$pod5_input" "a valid .pod5 file/directory or a name in $POD5_DIR"
+        warn_unexpected_input "$pod5_input" "a valid .pod5 file/directory in $POD5_DIR, or an explicit path like /path/to/sample.pod5"
         pod5_input=""
     done
 
     # Prompt for the reference FASTA when it was not supplied.
     while true; do
         if [[ -z "$reference_input" ]]; then
-            read -r -p "Enter reference FASTA filename from data/fastq, data/, or an explicit path: " reference_input
+            echo "[INFO] Available reference FASTA files in default path $DEFAULT_FASTQ_DIR:"
+            find "$DEFAULT_FASTQ_DIR" \
+                -maxdepth 1 \
+                -type f \
+                \( -name "*.fa" -o -name "*.fasta" -o -name "*.fna" \) \
+                -printf "  %f\n" |
+                sort
+            echo
+            read -r -p "Enter a reference FASTA filename from data/fastq, or an explicit path plus filename: " reference_input
         fi
 
         if [[ -z "$reference_input" ]]; then
-            warn_unexpected_input "$reference_input" "a FASTA filename or path, for example reference.fna"
+            warn_unexpected_input "$reference_input" "a FASTA filename in $DEFAULT_FASTQ_DIR, for example reference.fna, or an explicit path like /path/to/reference.fna"
             continue
         fi
 
@@ -704,7 +712,7 @@ submit_workflow() {
             break
         fi
 
-        warn_unexpected_input "$reference_input" "a valid path, a filename in $DEFAULT_FASTQ_DIR, or an exact filename under $WORKFLOW_ROOT/data"
+        warn_unexpected_input "$reference_input" "a valid FASTA filename in $DEFAULT_FASTQ_DIR, or an explicit path like /path/to/reference.fna"
         reference_input=""
     done
 

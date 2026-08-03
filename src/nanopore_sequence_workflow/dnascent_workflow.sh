@@ -598,14 +598,14 @@ submit_workflow() {
     # BAM files and prompt the user to select one.
     while true; do
         if [[ -z "$bam_input" ]]; then
-            echo "[INFO] Available BAM files in $BAM_DIR:"
+            echo "[INFO] Available BAM files in default path $BAM_DIR:"
             find "$BAM_DIR" -maxdepth 1 -type f -name "*.bam" -printf "  %f\n" | sort
             echo
-            read -r -p "Enter BAM filename from data/bam or an explicit path: " bam_input
+            read -r -p "Enter a BAM filename from data/bam, or an explicit path plus filename: " bam_input
         fi
 
         if [[ -z "$bam_input" ]]; then
-            warn_unexpected_input "$bam_input" "a BAM filename in $BAM_DIR or an explicit BAM path"
+            warn_unexpected_input "$bam_input" "a BAM filename in $BAM_DIR, for example sample.bam, or an explicit path like /path/to/sample.bam"
             continue
         fi
 
@@ -613,7 +613,7 @@ submit_workflow() {
             break
         fi
 
-        warn_unexpected_input "$bam_input" "a valid path or a filename in $BAM_DIR"
+        warn_unexpected_input "$bam_input" "a valid BAM filename in $BAM_DIR, or an explicit path like /path/to/sample.bam"
         bam_input=""
     done
 
@@ -626,14 +626,17 @@ submit_workflow() {
     # Prompt for the BAM index when one was not supplied as an argument.
     while true; do
         if [[ -z "$bam_index_input" ]]; then
-            bam_index_input="$(prompt_with_default "Enter BAM index filename from data/bam or an explicit path" "$default_bam_index")"
+            echo "[INFO] Available BAM index files in default path $BAM_DIR:"
+            find "$BAM_DIR" -maxdepth 1 -type f \( -name "*.bai" -o -name "*.csi" \) -printf "  %f\n" | sort
+            echo
+            bam_index_input="$(prompt_with_default "Enter a BAM index filename from data/bam, or an explicit path plus filename" "$default_bam_index")"
         fi
 
         if bam_index="$(resolve_bam_index_file "$bam_index_input")"; then
             break
         fi
 
-        warn_unexpected_input "$bam_index_input" "a valid BAM index path or a filename in $BAM_DIR, for example $(basename "$default_bam_index")"
+        warn_unexpected_input "$bam_index_input" "a BAM index filename in $BAM_DIR, for example $(basename "$default_bam_index"), or an explicit path like /path/to/sample.bam.bai"
         bam_index_input=""
     done
 
@@ -641,14 +644,14 @@ submit_workflow() {
     # one was not supplied as an argument.
     while true; do
         if [[ -z "$reference_input" ]]; then
-            echo "[INFO] Available reference FASTA files in $FASTQ_DIR:"
+            echo "[INFO] Available reference FASTA files in default path $FASTQ_DIR:"
             find "$FASTQ_DIR" -maxdepth 1 -type f \( -name "*.fa" -o -name "*.fasta" -o -name "*.fna" \) -printf "  %f\n" | sort
             echo
-            read -r -p "Enter reference FASTA filename from data/fastq, data/, or an explicit path: " reference_input
+            read -r -p "Enter a reference FASTA filename from data/fastq, or an explicit path plus filename: " reference_input
         fi
 
         if [[ -z "$reference_input" ]]; then
-            warn_unexpected_input "$reference_input" "a FASTA filename or path, for example reference.fna"
+            warn_unexpected_input "$reference_input" "a FASTA filename in $FASTQ_DIR, for example reference.fna, or an explicit path like /path/to/reference.fna"
             continue
         fi
 
@@ -656,7 +659,7 @@ submit_workflow() {
             break
         fi
 
-        warn_unexpected_input "$reference_input" "a valid path, a filename in $FASTQ_DIR, or an exact filename under $WORKFLOW_ROOT/data"
+        warn_unexpected_input "$reference_input" "a valid FASTA filename in $FASTQ_DIR, or an explicit path like /path/to/reference.fna"
         reference_input=""
     done
 
@@ -664,14 +667,14 @@ submit_workflow() {
     # one was not supplied as an argument.
     while true; do
         if [[ -z "$dnascent_index_input" ]]; then
-            echo "[INFO] Available DNAscent index files in $POD5_DIR:"
+            echo "[INFO] Available DNAscent index files in default path $POD5_DIR:"
             find "$POD5_DIR" -maxdepth 1 -type f -printf "  %f\n" | sort
             echo
-            read -r -p "Enter DNAscent index filename from data/pod5 or an explicit path: " dnascent_index_input
+            read -r -p "Enter a DNAscent index filename from data/pod5, or an explicit path plus filename: " dnascent_index_input
         fi
 
         if [[ -z "$dnascent_index_input" ]]; then
-            warn_unexpected_input "$dnascent_index_input" "a DNAscent index filename in $POD5_DIR or an explicit path"
+            warn_unexpected_input "$dnascent_index_input" "a DNAscent index filename in $POD5_DIR, or an explicit path like /path/to/dnascent.index"
             continue
         fi
 
@@ -679,7 +682,7 @@ submit_workflow() {
             break
         fi
 
-        warn_unexpected_input "$dnascent_index_input" "a valid path or a filename in $POD5_DIR"
+        warn_unexpected_input "$dnascent_index_input" "a valid DNAscent index filename in $POD5_DIR, or an explicit path like /path/to/dnascent.index"
         dnascent_index_input=""
     done
 
@@ -687,15 +690,15 @@ submit_workflow() {
     # when one was not supplied as an argument.
     while true; do
         if [[ -z "$pod5_input" ]]; then
-            echo "[INFO] Available POD5 files and directories in $POD5_DIR:"
+            echo "[INFO] Available POD5 files and directories in default path $POD5_DIR:"
             find "$POD5_DIR" -maxdepth 1 -type f -name "*.pod5" -printf "  %f\n" | sort
             find "$POD5_DIR" -mindepth 1 -maxdepth 1 -type d -printf "  %f/\n" | sort
             echo
-            read -r -p "Enter POD5 file/directory from data/pod5 or an explicit path: " pod5_input
+            read -r -p "Enter a POD5 file/directory from data/pod5, or an explicit path plus file/directory: " pod5_input
         fi
 
         if [[ -z "$pod5_input" ]]; then
-            warn_unexpected_input "$pod5_input" "a .pod5 file, a directory containing .pod5 files, or a name in $POD5_DIR"
+            warn_unexpected_input "$pod5_input" "a .pod5 file or directory in $POD5_DIR, or an explicit path like /path/to/sample.pod5"
             continue
         fi
 
@@ -703,7 +706,7 @@ submit_workflow() {
             break
         fi
 
-        warn_unexpected_input "$pod5_input" "a valid .pod5 file/directory or a name in $POD5_DIR"
+        warn_unexpected_input "$pod5_input" "a valid .pod5 file/directory in $POD5_DIR, or an explicit path like /path/to/sample.pod5"
         pod5_input=""
     done
 
@@ -720,6 +723,11 @@ submit_workflow() {
     # Collect the DNAscent container and runtime parameters.
     # The values in brackets are used when the user presses Enter.
     while true; do
+        if [[ -d "$(dirname "$DEFAULT_DNASCENT_IMAGE")" ]]; then
+            echo "[INFO] Available DNAscent container images in default path $(dirname "$DEFAULT_DNASCENT_IMAGE"):"
+            find "$(dirname "$DEFAULT_DNASCENT_IMAGE")" -maxdepth 1 -type f -name "*.sif" -printf "  %f\n" | sort
+            echo
+        fi
         dnascent_image="$(prompt_with_default "Enter DNAscent container image path" "$DEFAULT_DNASCENT_IMAGE")"
         if [[ -f "$dnascent_image" ]]; then
             break

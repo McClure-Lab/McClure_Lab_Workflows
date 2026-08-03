@@ -194,7 +194,22 @@ RESULTS_DIR="$WORKFLOW_ROOT/results/genome_browser_results"
 LOG_DIR="$WORKFLOW_ROOT/logs/genome_browser_workflow"
 
 # Default W303 reference FASTA used by Modkit pileup.
-DEFAULT_REF="$WORKFLOW_ROOT/data/ncbi/W303/ncbi_dataset/GCA_002163515.1_ASM216351v1_genomic.fna"
+DEFAULT_REF_DIR="$WORKFLOW_ROOT/data/ncbi/W303"
+DEFAULT_REF="$DEFAULT_REF_DIR/ncbi_dataset/GCA_002163515.1_ASM216351v1_genomic.fna"
+
+if [[ ! -f "$DEFAULT_REF" && -d "$DEFAULT_REF_DIR" ]]; then
+    DEFAULT_REF_FOUND="$(
+        find "$DEFAULT_REF_DIR" \
+            -type f \
+            \( -name "*.fna" -o -name "*.fa" -o -name "*.fasta" \) \
+            -print \
+            -quit
+    )"
+
+    if [[ -n "$DEFAULT_REF_FOUND" ]]; then
+        DEFAULT_REF="$DEFAULT_REF_FOUND"
+    fi
+fi
 
 # Optional genomic feature files used by the plotting scripts.
 #
@@ -280,24 +295,18 @@ absolute_existing_file() {
 # ==============================================================================
 #
 # Purpose:
-#   Resolve a BAM filename under the workflow's data/bam directory.
+#   Resolve a BAM from an explicit path or from the workflow's data/bam
+#   directory.
 #
 # Arguments:
 #   $1
 #       BAM filename or path supplied by the user.
 #
 # Behavior:
-#   Only the basename of the supplied value is used. This intentionally limits
-#   BAM selection to files stored directly under:
+#   Explicit paths are used when they exist. Otherwise, the input is treated as
+#   a filename under:
 #
 #       workflow_root/data/bam
-#
-# Example:
-#   Input:
-#       /some/other/path/sample.bam
-#
-#   Resolved candidate:
-#       workflow_root/data/bam/sample.bam
 #
 # Output:
 #   Absolute BAM path when the file exists.
@@ -310,6 +319,11 @@ resolve_bam_file() {
     local bam_input="$1"
     local bam_filename
     local bam_path
+
+    if [[ -f "$bam_input" ]]; then
+        absolute_existing_file "$bam_input"
+        return 0
+    fi
 
     # Remove any directory components supplied by the user.
     bam_filename="$(basename "$bam_input")"
@@ -1120,17 +1134,17 @@ submit_workflow() {
 
     while true; do
         if [[ -z "$bam_input" ]]; then
-            echo "[INFO] Available BAM files in $BAM_DIR:"
+            echo "[INFO] Available BAM files in default path $BAM_DIR:"
 
             # List BAM files directly inside data/bam, sorted alphabetically.
             find "$BAM_DIR" -maxdepth 1 -type f -name "*.bam" -printf "  %f\n" | sort
 
             echo
-            read -r -p "Enter the BAM filename from data/bam: " bam_input
+            read -r -p "Enter a BAM filename from data/bam, or an explicit path plus filename: " bam_input
         fi
 
         if [[ -z "$bam_input" ]]; then
-            warn_unexpected_input "$bam_input" "a BAM filename under $BAM_DIR, for example sample.bam"
+            warn_unexpected_input "$bam_input" "a BAM filename under $BAM_DIR, for example sample.bam, or an explicit path like /path/to/sample.bam"
             continue
         fi
 
@@ -1138,7 +1152,7 @@ submit_workflow() {
             break
         fi
 
-        warn_unexpected_input "$bam_input" "an existing BAM filename under $BAM_DIR, for example sample.bam"
+        warn_unexpected_input "$bam_input" "an existing BAM filename under $BAM_DIR, for example sample.bam, or an explicit path like /path/to/sample.bam"
         bam_input=""
     done
 
@@ -1167,14 +1181,23 @@ submit_workflow() {
     # Pressing Enter accepts DEFAULT_REF.
     #
     while true; do
-        read -r -p "Reference FASTA for modkit pileup [$DEFAULT_REF]: " ref_input
+        if [[ -d "$DEFAULT_REF_DIR" ]]; then
+            echo "[INFO] Available reference FASTA files in default path $DEFAULT_REF_DIR:"
+            find "$DEFAULT_REF_DIR" \
+                -type f \
+                \( -name "*.fna" -o -name "*.fa" -o -name "*.fasta" \) \
+                -printf "  %P\n" |
+                sort
+            echo
+        fi
+        read -r -p "Reference FASTA for modkit pileup [$DEFAULT_REF] or explicit path plus filename: " ref_input
         ref_input="${ref_input:-$DEFAULT_REF}"
 
         if reference="$(resolve_reference_file "$ref_input")"; then
             break
         fi
 
-        warn_unexpected_input "$ref_input" "an existing FASTA path, for example $DEFAULT_REF"
+        warn_unexpected_input "$ref_input" "a FASTA under $DEFAULT_REF_DIR, for example $(basename "$DEFAULT_REF"), or an explicit path like /path/to/reference.fna"
     done
 
     # --------------------------------------------------------------------------
