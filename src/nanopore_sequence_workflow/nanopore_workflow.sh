@@ -4,7 +4,7 @@
 #SBATCH --account=gpu_rbi
 #SBATCH --gpus=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=8
+#SBATCH --cpus-per-task=32
 #SBATCH --mem=16G
 #SBATCH --time=12:00:00
 
@@ -198,10 +198,22 @@ normalize_pod5_directory() {
         return 1
     fi
 
+    # Hard link every discovered .pod5 file into the staging directory
+    # (falling back to an actual copy only if hard-linking isn't possible,
+    # e.g. across filesystems). Deliberately NOT symlinks: a hard link is
+    # indistinguishable from a regular file to any tool's "-type f" check
+    # -- including dorado_basecall.sh's own POD5 validation and Dorado
+    # itself -- whereas a symlinked .pod5 file silently fails those same
+    # "-type f" checks (symlinks are "-type l"), making the directory
+    # look empty even though `ls` shows the files sitting right there.
     staged_dir="${dir%/}_pod5_staged"
     mkdir -p "$staged_dir"
     for pod5_file in "${pod5_files[@]}"; do
-        ln -sf "$pod5_file" "$staged_dir/$(basename "$pod5_file")"
+        local dest="$staged_dir/$(basename "$pod5_file")"
+        rm -f "$dest"
+        if ! ln "$pod5_file" "$dest" 2>/dev/null; then
+            cp "$pod5_file" "$dest"
+        fi
     done
 
     printf '%s\n' "$staged_dir"
@@ -489,6 +501,16 @@ load_nanopore_modules() {
 # on PATH yet, or its help output can't be parsed, this just warns and
 # lets the user type a kit name manually.
 list_available_barcode_kits() {
+    # This runs before load_nanopore_modules (which is only called later,
+    # once the rest of the interactive prompts are done), so on clusters
+    # where dorado is only available via `module load dorado`, it won't
+    # be on PATH yet at this point. Load it here too, quietly, so kit
+    # listing works without requiring the user to load it themselves
+    # first.
+    if ! command -v dorado >/dev/null 2>&1 && command -v module >/dev/null 2>&1; then
+        module load dorado >/dev/null 2>&1 || true
+    fi
+
     if ! command -v dorado >/dev/null 2>&1; then
         echo "[WARN] 'dorado' was not found in PATH; cannot list barcode kits automatically."
         echo "[WARN] Load the dorado module first, or check the kit name against Oxford Nanopore's documentation."
@@ -1306,7 +1328,7 @@ submit_workflow() {
 
     # Collect the CPU thread count used by alignment and BAM sorting.
     while true; do
-        threads="$(prompt_with_default "Enter --threads" "8")"
+        threads="$(prompt_with_default "Enter --threads" "32")"
         if is_positive_integer "$threads"; then
             break
         fi

@@ -31,7 +31,7 @@ LOG_LABEL=""
 # These starting values also act as the normal defaults unless they
 # are replaced by command-line arguments.
 PRESET="map-ont"
-THREADS="8"
+THREADS="32"
 SECONDARY="no"
 SORT_BAM="yes"
 INDEX_BAM="yes"
@@ -166,7 +166,7 @@ done
 
 # Apply default values when any optional variable is empty.
 PRESET="${PRESET:-map-ont}"
-THREADS="${THREADS:-8}"
+THREADS="${THREADS:-32}"
 SECONDARY="${SECONDARY:-no}"
 SORT_BAM="${SORT_BAM:-yes}"
 INDEX_BAM="${INDEX_BAM:-yes}"
