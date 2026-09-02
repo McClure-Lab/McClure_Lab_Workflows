@@ -5,7 +5,7 @@
 #SBATCH --gpus=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=64G
+#SBATCH --mem=16G
 #SBATCH --time=12:00:00
 
 # Stop the script immediately if:
@@ -58,18 +58,32 @@ else
     SRC_DIR="$SCRIPT_DIR"
 fi
 SCRIPT_PATH="$SRC_DIR/nanopore_workflow.sh"
-LOG_DIR="$WORKFLOW_ROOT/logs/nanopore_sequence_workflow"
 POD5_DIR="$WORKFLOW_ROOT/data/pod5"
-DEFAULT_FASTQ_DIR="$WORKFLOW_ROOT/data/fastq"
-DEFAULT_BAM_DIR="$WORKFLOW_ROOT/data/bam"
+
+# Reference FASTA files are still searched for under a fixed location,
+# independent of wherever a particular POD5 input happens to live.
+# (FASTQ/BAM/log *output* locations, by contrast, are derived from the
+# POD5 input's own location -- see derive_pod5_data_root() below. LOG_DIR
+# itself is set later, in submit_workflow/run_job, once the POD5 input has
+# been resolved and that root is known.)
+REFERENCE_SEARCH_DIR="$WORKFLOW_ROOT/data/fastq"
 
 # Display the expected positional arguments and default workflow behavior.
 usage() {
     echo "Usage: bash src/nanopore_sequence_workflow/nanopore_workflow.sh [POD5] [REFERENCE_FASTA] [FASTQ_OUTPUT_DIR] [BAM_OUTPUT_DIR]"
     echo
-    echo "POD5 may be a single .pod5 file or a directory of .pod5 files."
+    echo "POD5 may be a single .pod5 file, a directory of .pod5 files, or a .zip archive of .pod5 files."
     echo "Relative POD5 inputs are resolved under data/pod5."
-    echo "FASTQ and BAM outputs default to data/fastq and data/bam."
+    echo
+    echo "FASTQ, BAM, and log outputs default to folders created one directory above the POD5 input, e.g.:"
+    echo "  <one directory above POD5>/data/fastq"
+    echo "  <one directory above POD5>/data/bam_aligned"
+    echo "  <one directory above POD5>/data/bam_basecalled   (only used with --output-format both)"
+    echo "  <one directory above POD5>/logs/nanopore_sequence_workflow"
+    echo
+    echo "Dorado output format may be fastq, bam (aligned only), or both (basecalled BAM + derived FASTQ + aligned BAM)."
+    echo "Note: barcode demultiplexing always uses --output-format both internally, so every barcode gets both a"
+    echo "demuxed FASTQ and a demuxed aligned BAM automatically."
     echo
     echo "If arguments are omitted, the workflow prompts for them before submitting a SLURM job."
 }
@@ -82,13 +96,14 @@ usage() {
 # - Other relative values are placed under WORKFLOW_ROOT/data.
 resolve_data_output_dir() {
     local path="$1"
+    local root="$2"
 
     if [[ "$path" = /* ]]; then
         printf '%s\n' "$path"
     elif [[ "$path" == data/* ]]; then
-        printf '%s/%s\n' "$WORKFLOW_ROOT" "$path"
+        printf '%s/%s\n' "$root" "$path"
     else
-        printf '%s/data/%s\n' "$WORKFLOW_ROOT" "$path"
+        printf '%s/data/%s\n' "$root" "$path"
     fi
 }
 
@@ -107,26 +122,59 @@ absolute_existing_file() {
     absolute_existing_path "$1"
 }
 
+# Extract a .zip archive of POD5 files into a sibling directory (named
+# after the archive, minus .zip) and return that directory's path.
+#
+# An existing extraction is reused rather than re-extracted, so running
+# the workflow again against the same archive does not redo the work.
+extract_pod5_zip() {
+    local zip_path="$1"
+    local extract_dir="${zip_path%.zip}"
+
+    if [[ ! -d "$extract_dir" ]]; then
+        if ! command -v unzip >/dev/null 2>&1; then
+            echo "[ERROR] 'unzip' is required to extract $zip_path but was not found in PATH." >&2
+            exit 1
+        fi
+        echo "[INFO] Extracting POD5 archive: $zip_path -> $extract_dir" >&2
+        mkdir -p "$extract_dir"
+        unzip -q -o "$zip_path" -d "$extract_dir"
+    else
+        echo "[INFO] Reusing already-extracted POD5 directory: $extract_dir" >&2
+    fi
+
+    printf '%s\n' "$extract_dir"
+}
+
 # Resolve the POD5 input.
 #
 # The function first checks the input exactly as entered.
 # If it is not found, it checks data/pod5.
+# A .zip archive is extracted automatically (see extract_pod5_zip above)
+# and the extracted directory is used as the resolved POD5 input from
+# that point on.
 resolve_pod5_path() {
     local pod5_input="$1"
     local pod5_path
+    local resolved
 
     if [[ -f "$pod5_input" || -d "$pod5_input" ]]; then
-        absolute_existing_path "$pod5_input"
-        return 0
+        resolved="$(absolute_existing_path "$pod5_input")"
+    else
+        pod5_path="$POD5_DIR/$pod5_input"
+        if [[ -f "$pod5_path" || -d "$pod5_path" ]]; then
+            resolved="$(absolute_existing_path "$pod5_path")"
+        else
+            return 1
+        fi
     fi
 
-    pod5_path="$POD5_DIR/$pod5_input"
-    if [[ -f "$pod5_path" || -d "$pod5_path" ]]; then
-        absolute_existing_path "$pod5_path"
-        return 0
+    if [[ -f "$resolved" && "$resolved" == *.zip ]]; then
+        resolved="$(extract_pod5_zip "$resolved")"
     fi
 
-    return 1
+    printf '%s\n' "$resolved"
+    return 0
 }
 
 pod5_input_has_reads() {
@@ -138,6 +186,26 @@ pod5_input_has_reads() {
     fi
 
     find "$pod5_path" -maxdepth 1 -type f -name "*.pod5" -print -quit | grep -q .
+}
+
+# Determine the "data root" used for default FASTQ/BAM output locations:
+# the directory one level above wherever the resolved POD5 input lives.
+#
+# Example:
+# /projects/run1/pod5/sample.pod5  ->  pod5 directory: /projects/run1/pod5
+#                                   ->  data root:      /projects/run1
+#
+# Works the same whether the resolved POD5 input is a file or a directory
+# (including a directory produced by extract_pod5_zip above).
+derive_pod5_data_root() {
+    local resolved_pod5="$1"
+    local pod5_container_dir="$resolved_pod5"
+
+    if [[ -f "$resolved_pod5" ]]; then
+        pod5_container_dir="$(dirname "$resolved_pod5")"
+    fi
+
+    dirname "$pod5_container_dir"
 }
 
 # Resolve the reference FASTA path.
@@ -156,7 +224,7 @@ resolve_reference_file() {
         return 0
     fi
 
-    reference_path="$DEFAULT_FASTQ_DIR/$reference_input"
+    reference_path="$REFERENCE_SEARCH_DIR/$reference_input"
     if [[ -f "$reference_path" ]]; then
         absolute_existing_file "$reference_path"
         return 0
@@ -259,11 +327,12 @@ validate_optional_positive_integer() {
 validate_data_output_dir() {
     local name="$1"
     local path="$2"
+    local allowed_root="$3"
 
     case "$path" in
-        "$WORKFLOW_ROOT/data"/*) ;;
+        "$allowed_root"/*) ;;
         *)
-            echo "[ERROR] $name must be under $WORKFLOW_ROOT/data"
+            echo "[ERROR] $name must be under $allowed_root"
             echo "[ERROR] Resolved path was: $path"
             exit 1
             ;;
@@ -292,26 +361,60 @@ require_existing_dir() {
 # expects dorado, minimap2, and samtools to already be in PATH.
 load_nanopore_modules() {
     local output_format="${1:-fastq}"
+    local needs_minimap2="no"
+
+    # fastq aligns via minimap2; both derives a FASTQ from the basecalled
+    # BAM and also aligns it via minimap2. Plain bam mode has Dorado align
+    # internally and does not need minimap2 loaded separately.
+    if [[ "$output_format" == "fastq" || "$output_format" == "both" ]]; then
+        needs_minimap2="yes"
+    fi
 
     if command -v module >/dev/null 2>&1; then
-        if [[ "$output_format" == "fastq" ]]; then
+        if [[ "$needs_minimap2" == "yes" ]]; then
             echo "[INFO] Loading nanopore workflow modules: dorado, minimap2, samtools"
         else
             echo "[INFO] Loading nanopore workflow modules: dorado, samtools"
         fi
         module load dorado
-        if [[ "$output_format" == "fastq" ]]; then
+        if [[ "$needs_minimap2" == "yes" ]]; then
             module load minimap2
         fi
         module load samtools
     else
         echo "[WARN] Environment modules are not available in this shell."
-        if [[ "$output_format" == "fastq" ]]; then
+        if [[ "$needs_minimap2" == "yes" ]]; then
             echo "[WARN] Continuing with dorado, minimap2, and samtools from PATH."
         else
             echo "[WARN] Continuing with dorado and samtools from PATH."
         fi
     fi
+}
+
+# Print the barcode kit names Dorado currently recognizes, parsed
+# best-effort from 'dorado demux --help'. This deliberately does not fall
+# back to a hardcoded kit list -- ONT's supported kits change over time,
+# and a stale hardcoded list would be worse than no list. If dorado isn't
+# on PATH yet, or its help output can't be parsed, this just warns and
+# lets the user type a kit name manually.
+list_available_barcode_kits() {
+    if ! command -v dorado >/dev/null 2>&1; then
+        echo "[WARN] 'dorado' was not found in PATH; cannot list barcode kits automatically."
+        echo "[WARN] Load the dorado module first, or check the kit name against Oxford Nanopore's documentation."
+        return
+    fi
+
+    local kits
+    kits="$(dorado demux --help 2>&1 | grep -oE '[A-Z]+[A-Z0-9]*-[A-Z0-9-]*[0-9]+' | sort -u || true)"
+
+    if [[ -z "$kits" ]]; then
+        echo "[WARN] Could not automatically determine barcode kit names from 'dorado demux --help'."
+        echo "[WARN] Run 'dorado demux --help' manually, or check Oxford Nanopore's documentation for valid --kit-name values."
+        return
+    fi
+
+    echo "[INFO] Available barcode kits:"
+    printf '  %s\n' $kits
 }
 
 # Run the compute-node portion of the nanopore workflow.
@@ -324,6 +427,7 @@ run_job() {
     local reference=""
     local fastq_output_dir=""
     local bam_output_dir=""
+    local basecalled_bam_output_dir=""
     local dorado_model=""
     local device=""
     local min_qscore=""
@@ -355,6 +459,7 @@ run_job() {
             --reference) reference="$2"; shift 2 ;;
             --fastq-output-dir) fastq_output_dir="$2"; shift 2 ;;
             --bam-output-dir) bam_output_dir="$2"; shift 2 ;;
+            --basecalled-bam-output-dir) basecalled_bam_output_dir="$2"; shift 2 ;;
             --dorado-model) dorado_model="$2"; shift 2 ;;
             --device) device="$2"; shift 2 ;;
             --min-qscore) min_qscore="$2"; shift 2 ;;
@@ -380,14 +485,32 @@ run_job() {
         esac
     done
 
+    if [[ -z "$pod5" ]]; then
+        echo "[ERROR] --pod5 is required."
+        exit 1
+    fi
+
+    local pod5_data_root
+    pod5_data_root="$(derive_pod5_data_root "$pod5")"
+
+    # Logs live one directory above the POD5 input too, alongside the
+    # data/ output directories.
+    LOG_DIR="$pod5_data_root/logs/nanopore_sequence_workflow"
+
     output_format="${output_format:-fastq}"
     emit_moves="${emit_moves:-yes}"
-    barcode_output_dir="${barcode_output_dir:-$DEFAULT_BAM_DIR}"
+    if [[ "$output_format" == "both" ]]; then
+        # Demux against a "both" run splits the basecalled (unaligned) BAM,
+        # so barcode output belongs alongside it, not the aligned BAM dir.
+        barcode_output_dir="${barcode_output_dir:-$basecalled_bam_output_dir}"
+    else
+        barcode_output_dir="${barcode_output_dir:-$pod5_data_root/data/bam_aligned}"
+    fi
 
     case "$output_format" in
-        fastq|bam) ;;
+        fastq|bam|both) ;;
         *)
-            echo "[ERROR] Dorado output must be fastq or bam."
+            echo "[ERROR] Dorado output must be fastq, bam, or both."
             exit 1
             ;;
     esac
@@ -396,21 +519,27 @@ run_job() {
     validate_optional_positive_integer "--max-reads" "$max_reads"
 
     # Confirm that the selected output paths are under data/.
-    if [[ "$output_format" == "fastq" ]]; then
-        validate_data_output_dir "FASTQ output directory" "$fastq_output_dir"
+    if [[ "$output_format" == "fastq" || "$output_format" == "both" ]]; then
+        validate_data_output_dir "FASTQ output directory" "$fastq_output_dir" "$pod5_data_root/data"
     fi
-    validate_data_output_dir "BAM output directory" "$bam_output_dir"
+    validate_data_output_dir "BAM output directory" "$bam_output_dir" "$pod5_data_root/data"
+    if [[ "$output_format" == "both" ]]; then
+        validate_data_output_dir "Basecalled BAM output directory" "$basecalled_bam_output_dir" "$pod5_data_root/data"
+    fi
     if [[ "$barcode_mode" == "demux" ]]; then
-        validate_data_output_dir "Barcode output directory" "$barcode_output_dir"
+        validate_data_output_dir "Barcode output directory" "$barcode_output_dir" "$pod5_data_root/data"
     fi
 
     # Confirm that all required directories are available on the compute node.
     require_existing_dir "Workflow root" "$WORKFLOW_ROOT"
     require_existing_dir "Log directory" "$LOG_DIR"
-    if [[ "$output_format" == "fastq" ]]; then
+    if [[ "$output_format" == "fastq" || "$output_format" == "both" ]]; then
         require_existing_dir "FASTQ output directory" "$fastq_output_dir"
     fi
     require_existing_dir "BAM output directory" "$bam_output_dir"
+    if [[ "$output_format" == "both" ]]; then
+        require_existing_dir "Basecalled BAM output directory" "$basecalled_bam_output_dir"
+    fi
     if [[ "$barcode_mode" == "demux" ]]; then
         require_existing_dir "Barcode output directory" "$barcode_output_dir"
     fi
@@ -423,11 +552,17 @@ run_job() {
     local dorado_log
     local alignment_log
     local dorado_output
+    local dorado_call_format
     local fastq_file
     local bam_file
+    local basecalled_bam_file
+    local derived_fastq
     local dorado_output_dir
     local dorado_mm2_opts
     local barcode_dir
+    local barcode_fastq_dir
+    local barcode_aligned_dir
+    local barcode_derived_fastq
     local barcode_file
     local barcode_label
     local barcode_bam
@@ -450,6 +585,8 @@ run_job() {
         alignment_log="$LOG_DIR/${pod5_prefix}.${SLURM_JOB_ID:-manual}.barcode_alignment.log"
     elif [[ "$output_format" == "bam" ]]; then
         alignment_log="$LOG_DIR/${pod5_prefix}.${SLURM_JOB_ID:-manual}.dorado_alignment.log"
+    elif [[ "$output_format" == "both" ]]; then
+        alignment_log="$LOG_DIR/${pod5_prefix}.${SLURM_JOB_ID:-manual}.both_alignment.log"
     else
         alignment_log="$LOG_DIR/${pod5_prefix}.${SLURM_JOB_ID:-manual}.minimap2.log"
     fi
@@ -461,14 +598,23 @@ run_job() {
     echo "[INFO] Alignment/QC log: $alignment_log"
     echo "[INFO] Dorado output format: $output_format"
 
+    # Pick where Dorado itself should write, and which format to ask it
+    # for. "both" basecalls once into an unaligned BAM (bam_basecalled);
+    # the FASTQ and aligned BAM are produced afterward, below.
+    dorado_call_format="$output_format"
     dorado_output_dir="$fastq_output_dir"
     if [[ "$output_format" == "bam" ]]; then
         dorado_output_dir="$bam_output_dir"
+    elif [[ "$output_format" == "both" ]]; then
+        dorado_output_dir="$basecalled_bam_output_dir"
+        dorado_call_format="bam_basecalled"
     fi
 
     # Dorado exposes supported minimap2 alignment settings through
-    # --mm2-opts. The workflow's sort, index, MAPQ/read-length, and
-    # primary-only settings are handled by samtools after Dorado writes BAM.
+    # --mm2-opts. This only applies to Dorado's own basecall+align path
+    # (plain --output-format bam); "both" aligns separately below, and
+    # the workflow's sort, index, MAPQ/read-length, and primary-only
+    # settings are handled by samtools after alignment either way.
     dorado_mm2_opts=""
     if [[ "$output_format" == "bam" ]]; then
         dorado_mm2_opts="-x $preset"
@@ -490,7 +636,7 @@ run_job() {
         --device "$device" \
         --min-qscore "$min_qscore" \
         --max-reads "$max_reads" \
-        --output-format "$output_format" \
+        --output-format "$dorado_call_format" \
         --reference "$reference" \
         --emit-moves "$emit_moves" \
         --mm2-opts "$dorado_mm2_opts" \
@@ -501,7 +647,103 @@ run_job() {
 
     echo "[INFO] Dorado complete: $dorado_output"
 
-    if [[ "$barcode_mode" == "demux" ]]; then
+    if [[ "$barcode_mode" == "demux" && "$output_format" == "both" ]]; then
+        # Demultiplexing a "both" run: Dorado already basecalled once into
+        # a barcode-tagged unaligned BAM and demuxed it by barcode
+        # (dorado_basecall.sh, above). Each barcode's unaligned BAM is now
+        # turned into a derived FASTQ (samtools, no re-basecalling) and an
+        # aligned BAM, exactly like the non-demux "both" path -- this is
+        # what gives you both a demuxed FASTQ and a demuxed aligned BAM
+        # per barcode automatically.
+        barcode_dir="$barcode_output_dir/${pod5_prefix}_${SLURM_JOB_ID:-manual}"
+        barcode_fastq_dir="$fastq_output_dir/${pod5_prefix}_${SLURM_JOB_ID:-manual}"
+        barcode_aligned_dir="$bam_output_dir/${pod5_prefix}_${SLURM_JOB_ID:-manual}"
+        echo "[INFO] Processing demuxed basecalled BAMs in: $barcode_dir"
+        mkdir -p "$barcode_fastq_dir" "$barcode_aligned_dir"
+
+        for barcode_file in "$barcode_dir"/*.bam; do
+            [[ -f "$barcode_file" ]] || continue
+            barcode_files+=("$barcode_file")
+        done
+
+        if [[ "${#barcode_files[@]}" -eq 0 ]]; then
+            echo "[ERROR] No demuxed barcode files found in: $barcode_dir"
+            exit 1
+        fi
+
+        {
+            echo "========================================="
+            echo "  BARCODE ALIGNMENT/QC RUN"
+            echo "========================================="
+            echo "Started:       $(date)"
+            echo "Barcode dir:   $barcode_dir"
+            echo "Output format: both"
+            echo "Reference:     $reference"
+            echo "========================================="
+        } > "$alignment_log"
+
+        for barcode_file in "${barcode_files[@]}"; do
+            barcode_label="$(basename "$barcode_file")"
+            barcode_label="${barcode_label%.bam}"
+
+            echo "[INFO] Processing barcode file: $barcode_file"
+
+            # Sort and index this barcode's basecalled (unaligned) BAM
+            # in place before deriving a FASTQ from it or aligning it.
+            echo "[INFO] Sorting and indexing basecalled BAM for $barcode_label: $barcode_file" >> "$alignment_log"
+            samtools sort -@ "$threads" -o "${barcode_file}.sorted.tmp" "$barcode_file" >> "$alignment_log" 2>&1
+            mv "${barcode_file}.sorted.tmp" "$barcode_file"
+            samtools index "$barcode_file" >> "$alignment_log" 2>&1
+
+            barcode_derived_fastq="$barcode_fastq_dir/${barcode_label}.fastq"
+            echo "[INFO] Deriving FASTQ for $barcode_label: $barcode_derived_fastq" >> "$alignment_log"
+            samtools fastq "$barcode_file" > "$barcode_derived_fastq" 2>> "$alignment_log"
+
+            if [[ ! -s "$barcode_derived_fastq" ]]; then
+                echo "[ERROR] Derived FASTQ is empty or was not created: $barcode_derived_fastq" | tee -a "$alignment_log"
+                exit 1
+            fi
+
+            # Align the sorted, indexed basecalled BAM directly via
+            # 'dorado aligner' (--basecalled-bam) rather than the derived
+            # FASTQ, so move tables / modification tags survive alignment.
+            barcode_bam="$("$SRC_DIR/minimap2_alignment.sh" \
+                --basecalled-bam "$barcode_file" \
+                --reference "$reference" \
+                --output-dir "$barcode_aligned_dir" \
+                --log-file "$alignment_log" \
+                --preset "$preset" \
+                --threads "$threads" \
+                --secondary "$secondary" \
+                --sort "$sort_bam" \
+                --index "$index_bam" \
+                --min-mapq "$min_mapq" \
+                --min-read-length "$min_read_length" \
+                --primary-only "$primary_only" \
+                --append-log yes \
+                --log-label "$barcode_label")"
+
+            barcode_outputs+=("$barcode_bam")
+            echo "[INFO] Barcode alignment/QC complete: $barcode_bam"
+        done
+
+        {
+            echo ""
+            echo "========================================="
+            echo "  BARCODE ALIGNMENT/QC COMPLETE"
+            echo "========================================="
+            echo "Completed: $(date)"
+            echo "Basecalled (unaligned) BAMs: $barcode_dir"
+            echo "Derived FASTQs:              $barcode_fastq_dir"
+            echo "Final aligned BAMs:"
+            printf '%s\n' "${barcode_outputs[@]}"
+            echo "========================================="
+        } >> "$alignment_log"
+    elif [[ "$barcode_mode" == "demux" ]]; then
+        # Legacy single-format demux (fastq-only or bam-only), kept for
+        # direct invocation of this script outside the interactive
+        # submit_workflow path, which now always uses --output-format both
+        # for demux so every barcode gets both a FASTQ and an aligned BAM.
         barcode_dir="$barcode_output_dir/${pod5_prefix}_${SLURM_JOB_ID:-manual}"
         echo "[INFO] Aligning demuxed barcode files in: $barcode_dir"
 
@@ -611,6 +853,52 @@ run_job() {
             --primary-only "$primary_only")"
 
         echo "[INFO] Minimap2 complete: $bam_file"
+    elif [[ "$output_format" == "both" ]]; then
+        # "both": Dorado already basecalled once into an unaligned BAM
+        # (dorado_output, above). Sort and index that basecalled BAM in
+        # place, derive a FASTQ from it with samtools (no re-basecalling,
+        # kept purely as a FASTQ deliverable), then align the sorted
+        # basecalled BAM itself via 'dorado aligner' (not the FASTQ) so
+        # its tags -- move tables, base-modification calls -- survive
+        # alignment instead of being discarded by a FASTQ round-trip.
+        basecalled_bam_file="$dorado_output"
+        derived_fastq="$fastq_output_dir/${pod5_prefix}_${SLURM_JOB_ID:-manual}.fastq"
+
+        echo "[INFO] Basecalled (unaligned) BAM: $basecalled_bam_file"
+        echo "[INFO] Sorting and indexing basecalled BAM: $basecalled_bam_file" >> "$alignment_log"
+
+        samtools sort -@ "$threads" -o "${basecalled_bam_file}.sorted.tmp" "$basecalled_bam_file" >> "$alignment_log" 2>&1
+        mv "${basecalled_bam_file}.sorted.tmp" "$basecalled_bam_file"
+        samtools index "$basecalled_bam_file" >> "$alignment_log" 2>&1
+
+        echo "[INFO] Deriving FASTQ from basecalled BAM: $derived_fastq" >> "$alignment_log"
+        samtools fastq "$basecalled_bam_file" > "$derived_fastq" 2>> "$alignment_log"
+
+        if [[ ! -s "$derived_fastq" ]]; then
+            echo "[ERROR] Derived FASTQ is empty or was not created: $derived_fastq" | tee -a "$alignment_log"
+            exit 1
+        fi
+
+        echo "[INFO] Derived FASTQ: $derived_fastq"
+
+        bam_file="$("$SRC_DIR/minimap2_alignment.sh" \
+            --basecalled-bam "$basecalled_bam_file" \
+            --reference "$reference" \
+            --output-dir "$bam_output_dir" \
+            --log-file "$alignment_log" \
+            --preset "$preset" \
+            --threads "$threads" \
+            --secondary "$secondary" \
+            --sort "$sort_bam" \
+            --index "$index_bam" \
+            --min-mapq "$min_mapq" \
+            --min-read-length "$min_read_length" \
+            --primary-only "$primary_only")"
+
+        echo "[INFO] Dorado aligner complete: $bam_file"
+        echo "[INFO] Basecalled BAM (sorted, indexed): $basecalled_bam_file"
+        echo "[INFO] FASTQ:                            $derived_fastq"
+        echo "[INFO] Aligned BAM:                      $bam_file"
     else
         # Sort, index, optionally filter, and QC the Dorado-aligned BAM.
         bam_file="$("$SRC_DIR/minimap2_alignment.sh" \
@@ -653,6 +941,8 @@ submit_workflow() {
     local reference=""
     local fastq_output_dir
     local bam_output_dir
+    local basecalled_bam_output_dir=""
+    local basecalled_bam_output_input=""
     local output_format
     local emit_moves
     local run_demux
@@ -661,23 +951,31 @@ submit_workflow() {
     # Variables used to construct sample-specific names.
     local pod5_basename
     local pod5_prefix
+    local pod5_data_root
+    local default_fastq_output_dir
+    local default_basecalled_bam_dir
+    local default_aligned_bam_dir
 
     # Create the workflow's standard directories on the submission node.
-    mkdir -p "$LOG_DIR" "$POD5_DIR" "$DEFAULT_FASTQ_DIR" "$DEFAULT_BAM_DIR"
+    # (FASTQ/BAM output directories, and the log directory, are created
+    # later, once the POD5 input is resolved and the pod5-relative
+    # defaults can be computed.)
+    mkdir -p "$POD5_DIR" "$REFERENCE_SEARCH_DIR"
 
     # When no POD5 was provided as a positional argument, display the
-    # available POD5 files/directories and prompt the user to select one.
+    # available POD5 files/directories/archives and prompt the user to
+    # select one.
     while true; do
         if [[ -z "$pod5_input" ]]; then
-            echo "[INFO] Available POD5 files and directories in default path $POD5_DIR:"
-            find "$POD5_DIR" -maxdepth 1 -type f -name "*.pod5" -printf "  %f\n" | sort
+            echo "[INFO] Available POD5 files, directories, and .zip archives in default path $POD5_DIR:"
+            find "$POD5_DIR" -maxdepth 1 -type f \( -name "*.pod5" -o -name "*.zip" \) -printf "  %f\n" | sort
             find "$POD5_DIR" -mindepth 1 -maxdepth 1 -type d -printf "  %f/\n" | sort
             echo
-            read -r -p "Enter a POD5 file/directory from data/pod5, or an explicit path plus file/directory: " pod5_input
+            read -r -p "Enter a POD5 file/directory/.zip from data/pod5, or an explicit path plus file/directory: " pod5_input
         fi
 
         if [[ -z "$pod5_input" ]]; then
-            warn_unexpected_input "$pod5_input" "a .pod5 file or directory in $POD5_DIR, or an explicit path like /path/to/sample.pod5"
+            warn_unexpected_input "$pod5_input" "a .pod5 file, directory, or .zip archive in $POD5_DIR, or an explicit path like /path/to/sample.pod5"
             continue
         fi
 
@@ -685,15 +983,30 @@ submit_workflow() {
             break
         fi
 
-        warn_unexpected_input "$pod5_input" "a valid .pod5 file/directory in $POD5_DIR, or an explicit path like /path/to/sample.pod5"
+        warn_unexpected_input "$pod5_input" "a valid .pod5 file/directory/.zip in $POD5_DIR, or an explicit path like /path/to/sample.pod5"
         pod5_input=""
     done
+
+    # Default FASTQ/BAM output locations live one directory above wherever
+    # the resolved POD5 input actually is, e.g.:
+    #   /projects/run1/pod5/  ->  /projects/run1/data/fastq
+    #                             /projects/run1/data/bam_aligned
+    #                             /projects/run1/data/bam_basecalled
+    pod5_data_root="$(derive_pod5_data_root "$pod5")"
+    default_fastq_output_dir="$pod5_data_root/data/fastq"
+    default_basecalled_bam_dir="$pod5_data_root/data/bam_basecalled"
+    default_aligned_bam_dir="$pod5_data_root/data/bam_aligned"
+
+    # Logs live one directory above the POD5 input too, alongside the
+    # data/ output directories, rather than in a fixed repo-relative spot.
+    LOG_DIR="$pod5_data_root/logs/nanopore_sequence_workflow"
+    mkdir -p "$LOG_DIR"
 
     # Prompt for the reference FASTA when it was not supplied.
     while true; do
         if [[ -z "$reference_input" ]]; then
-            echo "[INFO] Available reference FASTA files in default path $DEFAULT_FASTQ_DIR:"
-            find "$DEFAULT_FASTQ_DIR" \
+            echo "[INFO] Available reference FASTA files in default path $REFERENCE_SEARCH_DIR:"
+            find "$REFERENCE_SEARCH_DIR" \
                 -maxdepth 1 \
                 -type f \
                 \( -name "*.fa" -o -name "*.fasta" -o -name "*.fna" \) \
@@ -704,7 +1017,7 @@ submit_workflow() {
         fi
 
         if [[ -z "$reference_input" ]]; then
-            warn_unexpected_input "$reference_input" "a FASTA filename in $DEFAULT_FASTQ_DIR, for example reference.fna, or an explicit path like /path/to/reference.fna"
+            warn_unexpected_input "$reference_input" "a FASTA filename in $REFERENCE_SEARCH_DIR, for example reference.fna, or an explicit path like /path/to/reference.fna"
             continue
         fi
 
@@ -712,61 +1025,17 @@ submit_workflow() {
             break
         fi
 
-        warn_unexpected_input "$reference_input" "a valid FASTA filename in $DEFAULT_FASTQ_DIR, or an explicit path like /path/to/reference.fna"
+        warn_unexpected_input "$reference_input" "a valid FASTA filename in $REFERENCE_SEARCH_DIR, or an explicit path like /path/to/reference.fna"
         reference_input=""
     done
 
     echo
-    echo "Dorado output selection"
-    while true; do
-        output_format="$(prompt_with_default "Should Dorado produce fastq or bam?" "bam")"
-        case "$output_format" in
-            fastq|bam) break ;;
-            *) warn_unexpected_input "$output_format" "fastq or bam, for example bam" ;;
-        esac
-    done
-
-    # Prompt for the FASTQ output directory only when FASTQ is selected.
-    if [[ "$output_format" == "fastq" && -z "$fastq_output_input" ]]; then
-        fastq_output_input="$(prompt_with_default "Enter FASTQ output directory under data/" "$DEFAULT_FASTQ_DIR")"
-    elif [[ -z "$fastq_output_input" ]]; then
-        fastq_output_input="$DEFAULT_FASTQ_DIR"
-    fi
-
-    # Prompt for the BAM output directory when it was not supplied.
-    if [[ -z "$bam_output_input" ]]; then
-        bam_output_input="$(prompt_with_default "Enter BAM output directory under data/" "$DEFAULT_BAM_DIR")"
-    fi
-
-    # Convert the supplied output-directory values into complete paths.
-    while true; do
-        fastq_output_dir="$(resolve_data_output_dir "$fastq_output_input")"
-        if [[ "$output_format" != "fastq" || "$fastq_output_dir" == "$WORKFLOW_ROOT/data"/* ]]; then
-            break
-        fi
-        warn_unexpected_input "$fastq_output_input" "a FASTQ output directory under $WORKFLOW_ROOT/data"
-        fastq_output_input="$(prompt_with_default "Enter FASTQ output directory under data/" "$DEFAULT_FASTQ_DIR")"
-    done
-
-    while true; do
-        bam_output_dir="$(resolve_data_output_dir "$bam_output_input")"
-        if [[ "$bam_output_dir" == "$WORKFLOW_ROOT/data"/* ]]; then
-            break
-        fi
-        warn_unexpected_input "$bam_output_input" "a BAM output directory under $WORKFLOW_ROOT/data"
-        bam_output_input="$(prompt_with_default "Enter BAM output directory under data/" "$DEFAULT_BAM_DIR")"
-    done
-
-    # Derive the sample prefix from the POD5 file or directory name.
-    pod5_basename="$(basename "$pod5")"
-    pod5_prefix="${pod5_basename%.pod5}"
-
-    echo
     echo "Dorado demultiplexing"
 
-    # Ask about Dorado demux before collecting the rest of the
-    # basecalling parameters so the barcode kit can be supplied to
-    # basecalling for barcode classification.
+    # Ask about demux before the Dorado output-format question below,
+    # because demultiplexing always produces both a demuxed FASTQ and a
+    # demuxed (aligned) BAM per barcode -- the format question is skipped
+    # and forced to "both" whenever demux is on.
     while true; do
         run_demux="$(prompt_with_default "Run dorado demux after basecalling? (yes or no)" "no")"
         if is_yes_no "$run_demux"; then
@@ -779,6 +1048,7 @@ submit_workflow() {
     kit_name=""
     if [[ "$run_demux" == "yes" ]]; then
         barcode_mode="demux"
+        list_available_barcode_kits
         while [[ -z "$kit_name" ]]; do
             kit_name="$(prompt_optional "Enter barcode-kit / --kit-name")"
             if [[ -z "$kit_name" ]]; then
@@ -786,6 +1056,76 @@ submit_workflow() {
             fi
         done
     fi
+
+    echo
+    echo "Dorado output selection"
+    if [[ "$barcode_mode" == "demux" ]]; then
+        output_format="both"
+        echo "[INFO] Demultiplexing always produces both a demuxed FASTQ and a demuxed (aligned) BAM per barcode."
+        echo "[INFO] Dorado output format is set to 'both' automatically."
+    else
+        while true; do
+            output_format="$(prompt_with_default "Should Dorado produce fastq, bam, or both?" "bam")"
+            case "$output_format" in
+                fastq|bam|both) break ;;
+                *) warn_unexpected_input "$output_format" "fastq, bam, or both, for example bam" ;;
+            esac
+        done
+    fi
+
+    # Prompt for the FASTQ output directory when FASTQ will actually be
+    # produced: the fastq-only path, or "both" (which derives a FASTQ
+    # from the basecalled BAM -- always the case when demuxing).
+    if [[ ( "$output_format" == "fastq" || "$output_format" == "both" ) && -z "$fastq_output_input" ]]; then
+        fastq_output_input="$(prompt_with_default "Enter FASTQ output directory under data/" "$default_fastq_output_dir")"
+    elif [[ -z "$fastq_output_input" ]]; then
+        fastq_output_input="$default_fastq_output_dir"
+    fi
+
+    # Prompt for the aligned BAM output directory when it was not supplied.
+    if [[ -z "$bam_output_input" ]]; then
+        bam_output_input="$(prompt_with_default "Enter aligned BAM output directory under data/" "$default_aligned_bam_dir")"
+    fi
+
+    # Prompt for a separate basecalled (unaligned) BAM output directory
+    # only when producing both (always the case when demuxing).
+    if [[ "$output_format" == "both" ]]; then
+        basecalled_bam_output_input="$(prompt_with_default "Enter basecalled (unaligned) BAM output directory under data/" "$default_basecalled_bam_dir")"
+    fi
+
+    # Convert the supplied output-directory values into complete paths.
+    while true; do
+        fastq_output_dir="$(resolve_data_output_dir "$fastq_output_input" "$pod5_data_root")"
+        if [[ ( "$output_format" != "fastq" && "$output_format" != "both" ) || "$fastq_output_dir" == "$pod5_data_root/data"/* ]]; then
+            break
+        fi
+        warn_unexpected_input "$fastq_output_input" "a FASTQ output directory under $pod5_data_root/data"
+        fastq_output_input="$(prompt_with_default "Enter FASTQ output directory under data/" "$default_fastq_output_dir")"
+    done
+
+    while true; do
+        bam_output_dir="$(resolve_data_output_dir "$bam_output_input" "$pod5_data_root")"
+        if [[ "$bam_output_dir" == "$pod5_data_root/data"/* ]]; then
+            break
+        fi
+        warn_unexpected_input "$bam_output_input" "a BAM output directory under $pod5_data_root/data"
+        bam_output_input="$(prompt_with_default "Enter aligned BAM output directory under data/" "$default_aligned_bam_dir")"
+    done
+
+    if [[ "$output_format" == "both" ]]; then
+        while true; do
+            basecalled_bam_output_dir="$(resolve_data_output_dir "$basecalled_bam_output_input" "$pod5_data_root")"
+            if [[ "$basecalled_bam_output_dir" == "$pod5_data_root/data"/* ]]; then
+                break
+            fi
+            warn_unexpected_input "$basecalled_bam_output_input" "a basecalled BAM output directory under $pod5_data_root/data"
+            basecalled_bam_output_input="$(prompt_with_default "Enter basecalled (unaligned) BAM output directory under data/" "$default_basecalled_bam_dir")"
+        done
+    fi
+
+    # Derive the sample prefix from the POD5 file or directory name.
+    pod5_basename="$(basename "$pod5")"
+    pod5_prefix="${pod5_basename%.pod5}"
 
     echo
     echo "Dorado/basecalling parameters"
@@ -830,12 +1170,19 @@ submit_workflow() {
         warn_unexpected_input "$emit_moves" "yes or no"
     done
 
-    if [[ "$output_format" == "fastq" ]]; then
-        echo "[INFO] --emit-fastq is enabled because the FASTQ path uses Minimap2 alignment."
-        echo "[INFO] --emit-moves is ignored for FASTQ output because FASTQ cannot store move-table tags."
-    else
-        echo "[INFO] Dorado will basecall and align with --reference, producing BAM output."
-    fi
+    case "$output_format" in
+        fastq)
+            echo "[INFO] --emit-fastq is enabled because the FASTQ path uses Minimap2 alignment."
+            echo "[INFO] --emit-moves is ignored for FASTQ output because FASTQ cannot store move-table tags."
+            ;;
+        bam)
+            echo "[INFO] Dorado will basecall and align with --reference, producing an aligned BAM."
+            ;;
+        both)
+            echo "[INFO] Dorado will basecall once into an unaligned BAM (basecalled BAM directory)."
+            echo "[INFO] A FASTQ is then derived from that BAM (no re-basecalling) and aligned separately to produce the aligned BAM."
+            ;;
+    esac
 
     # Optionally collect a Dorado modified-base model or code.
     modified_bases="$(prompt_optional "Enter --modified-bases (optional; press Enter to skip)")"
@@ -909,10 +1256,13 @@ submit_workflow() {
     done
 
     # Create the selected output directories.
-    if [[ "$output_format" == "fastq" ]]; then
+    if [[ "$output_format" == "fastq" || "$output_format" == "both" ]]; then
         mkdir -p "$fastq_output_dir"
     fi
     mkdir -p "$bam_output_dir"
+    if [[ "$output_format" == "both" ]]; then
+        mkdir -p "$basecalled_bam_output_dir"
+    fi
 
     # Load the required software on the submission node.
     #
@@ -923,13 +1273,27 @@ submit_workflow() {
     # Display the resolved workflow and output locations.
     echo
     echo "[INFO] Workflow root: $WORKFLOW_ROOT"
+    echo "[INFO] POD5 data root (used for default output paths): $pod5_data_root"
     echo "[INFO] Dorado output format: $output_format"
-    if [[ "$output_format" == "fastq" ]]; then
+    if [[ "$output_format" == "fastq" || "$output_format" == "both" ]]; then
         echo "[INFO] FASTQ output directory: $fastq_output_dir"
     fi
-    echo "[INFO] BAM output directory: $bam_output_dir"
+    echo "[INFO] Aligned BAM output directory: $bam_output_dir"
+    if [[ "$output_format" == "both" ]]; then
+        echo "[INFO] Basecalled BAM output directory: $basecalled_bam_output_dir"
+    fi
     echo
     echo "Submitting nanopore workflow to SLURM..."
+
+    # Demux against a "both" run splits the basecalled (unaligned) BAM, so
+    # barcode output belongs alongside it; otherwise it belongs alongside
+    # whatever aligned BAM directory you actually chose (not a hardcoded
+    # default -- this is the fix for the earlier "always uses the default
+    # aligned-BAM directory" issue).
+    local barcode_output_dir_to_pass="$bam_output_dir"
+    if [[ "$output_format" == "both" ]]; then
+        barcode_output_dir_to_pass="$basecalled_bam_output_dir"
+    fi
 
     # Submit this same script to SLURM in --run-job mode.
     #
@@ -969,6 +1333,7 @@ submit_workflow() {
         --reference "$reference" \
         --fastq-output-dir "$fastq_output_dir" \
         --bam-output-dir "$bam_output_dir" \
+        --basecalled-bam-output-dir "$basecalled_bam_output_dir" \
         --dorado-model "$dorado_model" \
         --device "$device" \
         --min-qscore "$min_qscore" \
@@ -977,7 +1342,7 @@ submit_workflow() {
         --emit-moves "$emit_moves" \
         --kit-name "$kit_name" \
         --barcode-mode "$barcode_mode" \
-        --barcode-output-dir "$DEFAULT_BAM_DIR" \
+        --barcode-output-dir "$barcode_output_dir_to_pass" \
         --modified-bases "$modified_bases" \
         --preset "$preset" \
         --threads "$threads" \
@@ -994,15 +1359,27 @@ submit_workflow() {
 
     # Display the submitted job and all expected output/log paths.
     echo "[INFO] Submitted SLURM job: $job_id"
-    if [[ "$output_format" == "fastq" ]]; then
-        echo "[INFO] Expected FASTQ: $fastq_output_dir/${pod5_prefix}_${log_job_id}.fastq"
-        echo "[INFO] Expected raw BAM: $bam_output_dir/${pod5_prefix}_${log_job_id}.bam"
-    else
-        echo "[INFO] Expected Dorado aligned BAM: $bam_output_dir/${pod5_prefix}_${log_job_id}.bam"
-        echo "[INFO] Expected raw BAM: $bam_output_dir/${pod5_prefix}_${log_job_id}.dorado.raw.bam"
-    fi
+    case "$output_format" in
+        fastq)
+            echo "[INFO] Expected FASTQ: $fastq_output_dir/${pod5_prefix}_${log_job_id}.fastq"
+            echo "[INFO] Expected raw BAM: $bam_output_dir/${pod5_prefix}_${log_job_id}.bam"
+            ;;
+        bam)
+            echo "[INFO] Expected Dorado aligned BAM: $bam_output_dir/${pod5_prefix}_${log_job_id}.bam"
+            echo "[INFO] Expected raw BAM: $bam_output_dir/${pod5_prefix}_${log_job_id}.dorado.raw.bam"
+            ;;
+        both)
+            echo "[INFO] Expected basecalled (unaligned) BAM: $basecalled_bam_output_dir/${pod5_prefix}_${log_job_id}.bam"
+            echo "[INFO] Expected derived FASTQ: $fastq_output_dir/${pod5_prefix}_${log_job_id}.fastq"
+            echo "[INFO] Expected raw aligned BAM: $bam_output_dir/${pod5_prefix}_${log_job_id}.bam"
+            ;;
+    esac
     if [[ "$barcode_mode" == "demux" ]]; then
-        echo "[INFO] Expected barcode output directory: $DEFAULT_BAM_DIR/${pod5_prefix}_${log_job_id}"
+        echo "[INFO] Expected demuxed basecalled BAMs: $barcode_output_dir_to_pass/${pod5_prefix}_${log_job_id}"
+        if [[ "$output_format" == "both" ]]; then
+            echo "[INFO] Expected demuxed FASTQs:         $fastq_output_dir/${pod5_prefix}_${log_job_id}"
+            echo "[INFO] Expected demuxed aligned BAMs:   $bam_output_dir/${pod5_prefix}_${log_job_id}"
+        fi
         echo "[INFO] Expected barcode alignment/QC log: $LOG_DIR/${pod5_prefix}.${log_job_id}.barcode_alignment.log"
     else
         echo "[INFO] Expected sorted indexed BAM: $bam_output_dir/${pod5_prefix}.sorted.indexed_${log_job_id}.bam"
@@ -1014,6 +1391,8 @@ submit_workflow() {
         echo "[INFO] Alignment/QC log: $LOG_DIR/${pod5_prefix}.${log_job_id}.barcode_alignment.log"
     elif [[ "$output_format" == "fastq" ]]; then
         echo "[INFO] Alignment/QC log: $LOG_DIR/${pod5_prefix}.${log_job_id}.minimap2.log"
+    elif [[ "$output_format" == "both" ]]; then
+        echo "[INFO] Alignment/QC log: $LOG_DIR/${pod5_prefix}.${log_job_id}.both_alignment.log"
     else
         echo "[INFO] Alignment/QC log: $LOG_DIR/${pod5_prefix}.${log_job_id}.dorado_alignment.log"
     fi

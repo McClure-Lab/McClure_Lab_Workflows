@@ -8,12 +8,18 @@ set -euo pipefail
 
 # Display the expected command-line arguments for the alignment script.
 usage() {
-    echo "Usage: bash src/nanopore_sequence_workflow/minimap2_alignment.sh (--fastq FASTQ --reference FASTA | --input-bam BAM) --output-dir DIR --log-file LOG --preset PRESET --threads N --secondary yes|no --sort yes|no --index yes|no --min-mapq N --min-read-length N --primary-only yes|no [--append-log yes|no] [--log-label LABEL]"
+    echo "Usage: bash src/nanopore_sequence_workflow/minimap2_alignment.sh (--fastq FASTQ --reference FASTA | --input-bam BAM | --basecalled-bam BAM --reference FASTA) --output-dir DIR --log-file LOG --preset PRESET --threads N --secondary yes|no --sort yes|no --index yes|no --min-mapq N --min-read-length N --primary-only yes|no [--append-log yes|no] [--log-label LABEL]"
+    echo
+    echo "--fastq aligns a FASTQ file with minimap2 (no BAM tags to preserve)."
+    echo "--input-bam sorts/indexes/filters/QCs a BAM Dorado already aligned itself; no realignment happens."
+    echo "--basecalled-bam aligns an unaligned, Dorado-basecalled BAM via 'dorado aligner', preserving its"
+    echo "tags (move tables, base-modification calls, etc.) that a FASTQ round-trip would otherwise destroy."
 }
 
 # Initialize the required input paths.
 FASTQ=""
 INPUT_BAM=""
+BASECALLED_BAM=""
 REFERENCE=""
 OUTPUT_DIR=""
 LOG_FILE=""
@@ -45,6 +51,14 @@ while [[ $# -gt 0 ]]; do
         # Path to a BAM already produced by Dorado basecaller alignment.
         --input-bam|--bam)
             INPUT_BAM="$2"
+            shift 2
+            ;;
+
+        # Path to an unaligned, Dorado-basecalled BAM to align via
+        # 'dorado aligner', preserving its tags (move tables, modified-
+        # base calls, etc.).
+        --basecalled-bam)
+            BASECALLED_BAM="$2"
             shift 2
             ;;
 
@@ -168,13 +182,18 @@ if [[ -z "$OUTPUT_DIR" || -z "$LOG_FILE" ]]; then
     exit 1
 fi
 
-if [[ -n "$FASTQ" && -n "$INPUT_BAM" ]]; then
-    echo "[ERROR] Use either --fastq or --input-bam, not both."
+INPUT_MODE_COUNT=0
+[[ -n "$FASTQ" ]] && INPUT_MODE_COUNT=$((INPUT_MODE_COUNT + 1))
+[[ -n "$INPUT_BAM" ]] && INPUT_MODE_COUNT=$((INPUT_MODE_COUNT + 1))
+[[ -n "$BASECALLED_BAM" ]] && INPUT_MODE_COUNT=$((INPUT_MODE_COUNT + 1))
+
+if [[ "$INPUT_MODE_COUNT" -gt 1 ]]; then
+    echo "[ERROR] Use only one of --fastq, --input-bam, or --basecalled-bam."
     exit 1
 fi
 
-if [[ -z "$FASTQ" && -z "$INPUT_BAM" ]]; then
-    echo "[ERROR] Either --fastq or --input-bam is required."
+if [[ "$INPUT_MODE_COUNT" -eq 0 ]]; then
+    echo "[ERROR] One of --fastq, --input-bam, or --basecalled-bam is required."
     exit 1
 fi
 
@@ -200,6 +219,25 @@ fi
 if [[ -n "$INPUT_BAM" && ! -s "$INPUT_BAM" ]]; then
     echo "[ERROR] Input BAM file is empty or not found: $INPUT_BAM"
     exit 1
+fi
+
+if [[ -n "$BASECALLED_BAM" ]]; then
+    if [[ -z "$REFERENCE" ]]; then
+        echo "[ERROR] --reference is required when --basecalled-bam is used."
+        exit 1
+    fi
+
+    # Confirm that the basecalled BAM exists and is not empty.
+    if [[ ! -s "$BASECALLED_BAM" ]]; then
+        echo "[ERROR] Basecalled BAM file is empty or not found: $BASECALLED_BAM"
+        exit 1
+    fi
+
+    # Confirm that the reference FASTA exists.
+    if [[ ! -f "$REFERENCE" ]]; then
+        echo "[ERROR] Reference FASTA not found: $REFERENCE"
+        exit 1
+    fi
 fi
 
 # Validate the value used to control secondary alignments.
@@ -270,7 +308,7 @@ mkdir -p "$OUTPUT_DIR" "$(dirname "$LOG_FILE")"
 # Examples:
 # sample.fastq becomes sample
 # sample.fq becomes sample
-INPUT_BASENAME="$(basename "${FASTQ:-$INPUT_BAM}")"
+INPUT_BASENAME="$(basename "${FASTQ:-${INPUT_BAM:-$BASECALLED_BAM}}")"
 INPUT_PREFIX="${INPUT_BASENAME%.fastq}"
 INPUT_PREFIX="${INPUT_PREFIX%.fq}"
 INPUT_PREFIX="${INPUT_PREFIX%.bam}"
@@ -350,6 +388,8 @@ write_alignment_config() {
     fi
     if [[ -n "$INPUT_BAM" ]]; then
         echo "  DORADO BAM ALIGNMENT QC"
+    elif [[ -n "$BASECALLED_BAM" ]]; then
+        echo "  DORADO ALIGNER (basecalled BAM, tags preserved)"
     else
         echo "  MINIMAP2 ALIGNMENT"
     fi
@@ -357,6 +397,7 @@ write_alignment_config() {
     echo "Started:         $(date)"
     echo "FASTQ:           ${FASTQ:-none}"
     echo "Input BAM:       ${INPUT_BAM:-none}"
+    echo "Basecalled BAM:  ${BASECALLED_BAM:-none}"
     echo "Reference:       ${REFERENCE:-none}"
     echo "Raw BAM:         $RAW_BAM"
     echo "Final BAM:       $BAM_FILE"
@@ -435,6 +476,36 @@ if [[ -n "$FASTQ" ]]; then
     #
     # Error messages from both commands are appended to the log file.
     minimap2 "${MINIMAP2_ARGS[@]}" 2>> "$LOG_FILE" | samtools view "${SAMTOOLS_VIEW_ARGS[@]}" -o "$RAW_BAM" - 2>> "$LOG_FILE"
+elif [[ -n "$BASECALLED_BAM" ]]; then
+    # 'dorado aligner' realigns an already-basecalled BAM directly and
+    # carries its existing tags (move tables, base-modification calls,
+    # etc.) through onto the aligned output -- unlike converting to FASTQ
+    # first, which would discard everything but the sequence and quality.
+    DORADO_ALIGN_MM2_OPTS="-x $PRESET"
+    if [[ -n "$SECONDARY_FLAG" ]]; then
+        DORADO_ALIGN_MM2_OPTS="$DORADO_ALIGN_MM2_OPTS $SECONDARY_FLAG"
+    fi
+
+    DORADO_ALIGN_ARGS=(
+        aligner
+        "$REFERENCE"
+        "$BASECALLED_BAM"
+        --mm2-opts "$DORADO_ALIGN_MM2_OPTS"
+        -t "$THREADS"
+    )
+
+    {
+        echo ""
+        echo "[INFO] Running dorado aligner (preserving basecalled BAM tags)."
+        printf '[INFO] Command: dorado'
+        printf ' %q' "${DORADO_ALIGN_ARGS[@]}"
+        echo " | samtools view ${SAMTOOLS_VIEW_ARGS[*]} -o $RAW_BAM"
+    } >> "$LOG_FILE"
+
+    # dorado aligner writes BAM records to standard output; samtools view
+    # applies the same primary-only filtering used everywhere else in
+    # this script and writes the raw BAM file.
+    dorado "${DORADO_ALIGN_ARGS[@]}" 2>> "$LOG_FILE" | samtools view "${SAMTOOLS_VIEW_ARGS[@]}" -o "$RAW_BAM" - 2>> "$LOG_FILE"
 else
     {
         echo ""
