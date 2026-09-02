@@ -73,6 +73,8 @@ usage() {
     echo "Usage: bash src/nanopore_sequence_workflow/nanopore_workflow.sh [POD5] [REFERENCE_FASTA] [FASTQ_OUTPUT_DIR] [BAM_OUTPUT_DIR]"
     echo
     echo "POD5 may be a single .pod5 file, a directory of .pod5 files, or a .zip archive of .pod5 files."
+    echo "A directory may also contain a .zip archive, or nested subfolders of .pod5 files, instead of"
+    echo "flat .pod5 files directly inside it -- any of these are found and normalized automatically."
     echo "Relative POD5 inputs are resolved under data/pod5."
     echo
     echo "FASTQ, BAM, and log outputs default to folders created one directory above the POD5 input, e.g.:"
@@ -146,46 +148,135 @@ extract_pod5_zip() {
     printf '%s\n' "$extract_dir"
 }
 
-# Resolve the POD5 input.
+# Normalize a POD5 directory so Dorado can be pointed straight at it.
 #
-# The function first checks the input exactly as entered.
-# If it is not found, it checks data/pod5.
-# A .zip archive is extracted automatically (see extract_pod5_zip above)
-# and the extracted directory is used as the resolved POD5 input from
-# that point on.
-resolve_pod5_path() {
+# Handles, in any combination, at any depth under the given directory:
+# - .pod5 files already sitting directly in it (the simple, common case),
+# - .pod5 files nested in subfolders (e.g. a zip that unpacked into its
+#   own named folder instead of unpacking flat),
+# - .zip archives found anywhere under it (each is extracted in place via
+#   extract_pod5_zip).
+#
+# If everything is already flat (only top-level .pod5 files, no nested
+# .pod5, no .zip anywhere below), the directory is returned unchanged.
+# Otherwise every .pod5 file discovered (original or freshly extracted)
+# is symlinked into a flat staging directory ("<dir>_pod5_staged"), and
+# that staging directory is returned instead, so the caller always ends
+# up with something Dorado can read directly.
+normalize_pod5_directory() {
+    local dir="$1"
+    local top_level_pod5_count
+    local nested_pod5_count
+    local zip_count
+    local zip_file
+    local pod5_file
+    local staged_dir
+
+    top_level_pod5_count=$(find "$dir" -maxdepth 1 -type f -name "*.pod5" | wc -l)
+    nested_pod5_count=$(find "$dir" -mindepth 2 -type f -name "*.pod5" | wc -l)
+    zip_count=$(find "$dir" -type f -name "*.zip" | wc -l)
+
+    if [[ "$top_level_pod5_count" -gt 0 && "$nested_pod5_count" -eq 0 && "$zip_count" -eq 0 ]]; then
+        printf '%s\n' "$dir"
+        return 0
+    fi
+
+    # Extract every .zip found anywhere under this directory (each next to
+    # itself; extract_pod5_zip reuses an existing extraction if present).
+    while IFS= read -r zip_file; do
+        extract_pod5_zip "$zip_file" >/dev/null
+    done < <(find "$dir" -type f -name "*.zip")
+
+    # Collect every .pod5 file now present anywhere under this directory,
+    # originals and anything just extracted from a zip alike.
+    local pod5_files=()
+    while IFS= read -r pod5_file; do
+        pod5_files+=("$pod5_file")
+    done < <(find "$dir" -type f -name "*.pod5")
+
+    if [[ "${#pod5_files[@]}" -eq 0 ]]; then
+        return 1
+    fi
+
+    staged_dir="${dir%/}_pod5_staged"
+    mkdir -p "$staged_dir"
+    for pod5_file in "${pod5_files[@]}"; do
+        ln -sf "$pod5_file" "$staged_dir/$(basename "$pod5_file")"
+    done
+
+    printf '%s\n' "$staged_dir"
+    return 0
+}
+
+# Resolve the POD5 input to an existing file or directory path, WITHOUT
+# extracting any .zip archive or otherwise touching its contents.
+#
+# This is the only POD5 resolution step meant to run on a login/submission
+# node: it just confirms *something* exists at the given path (checked as
+# entered, then under data/pod5), which is cheap regardless of how large
+# the eventual POD5 data turns out to be. Actual extraction/normalization
+# (extract_pod5_zip / normalize_pod5_directory, below) is deliberately
+# deferred to run_job, so it only ever happens on a compute node, after
+# the SLURM job has been submitted -- not while a user is sitting at an
+# interactive prompt on the login node.
+resolve_pod5_input_path() {
     local pod5_input="$1"
     local pod5_path
-    local resolved
 
     if [[ -f "$pod5_input" || -d "$pod5_input" ]]; then
-        resolved="$(absolute_existing_path "$pod5_input")"
-    else
-        pod5_path="$POD5_DIR/$pod5_input"
-        if [[ -f "$pod5_path" || -d "$pod5_path" ]]; then
-            resolved="$(absolute_existing_path "$pod5_path")"
-        else
-            return 1
-        fi
+        absolute_existing_path "$pod5_input"
+        return 0
     fi
+
+    pod5_path="$POD5_DIR/$pod5_input"
+    if [[ -f "$pod5_path" || -d "$pod5_path" ]]; then
+        absolute_existing_path "$pod5_path"
+        return 0
+    fi
+
+    return 1
+}
+
+# A cheap, non-extracting plausibility check: does this resolved path
+# look like it could contain POD5 data? Only inspects filenames (find
+# never opens/decompresses anything), so it stays safe to run on a login
+# node even against a very large POD5 directory tree. A single file must
+# itself be .pod5 or .zip; a directory must contain a .pod5 or .zip
+# *somewhere* under it (any depth), matching what normalize_pod5_directory
+# is later able to find and extract on the compute node.
+pod5_input_looks_valid() {
+    local pod5_path="$1"
+
+    if [[ -f "$pod5_path" ]]; then
+        [[ "$pod5_path" == *.pod5 || "$pod5_path" == *.zip ]]
+        return
+    fi
+
+    find "$pod5_path" -type f \( -name "*.pod5" -o -name "*.zip" \) -print -quit | grep -q .
+}
+
+# Fully resolve the POD5 input to something Dorado can be pointed at
+# directly: extracts a .zip archive given directly (extract_pod5_zip),
+# and/or normalizes a directory that contains nested .pod5 files or .zip
+# archives anywhere under it (normalize_pod5_directory). This does real
+# extraction I/O and is only ever called from run_job, i.e. on the
+# compute node, never during the interactive submission prompts.
+resolve_pod5_path() {
+    local pod5_input="$1"
+    local resolved
+
+    resolved="$(resolve_pod5_input_path "$pod5_input")" || return 1
 
     if [[ -f "$resolved" && "$resolved" == *.zip ]]; then
         resolved="$(extract_pod5_zip "$resolved")"
     fi
 
-    printf '%s\n' "$resolved"
-    return 0
-}
-
-pod5_input_has_reads() {
-    local pod5_path="$1"
-
-    if [[ -f "$pod5_path" ]]; then
-        [[ "$pod5_path" == *.pod5 ]]
-        return
+    if [[ -d "$resolved" ]]; then
+        resolved="$(normalize_pod5_directory "$resolved")" || return 1
     fi
 
-    find "$pod5_path" -maxdepth 1 -type f -name "*.pod5" -print -quit | grep -q .
+    printf '%s\n' "$resolved"
+    return 0
 }
 
 # Determine the "data root" used for default FASTQ/BAM output locations:
@@ -549,6 +640,7 @@ run_job() {
 
     local pod5_basename
     local pod5_prefix
+    local actual_pod5
     local dorado_log
     local alignment_log
     local dorado_output
@@ -569,12 +661,17 @@ run_job() {
     local barcode_outputs=()
     local barcode_files=()
 
-    # Derive the sample name from the POD5 file or directory name.
+    # Derive the sample name from the POD5 file or directory name. Uses
+    # $pod5 as originally given (before any extraction/normalization
+    # below), so this matches the name submit_workflow already used to
+    # build the SLURM job name and output paths.
     #
-    # Example:
+    # Examples:
     # sample.pod5 becomes sample
+    # sample.zip  becomes sample
     pod5_basename="$(basename "$pod5")"
     pod5_prefix="${pod5_basename%.pod5}"
+    pod5_prefix="${pod5_prefix%.zip}"
 
     # Construct separate log files for Dorado and alignment/QC.
     #
@@ -623,13 +720,25 @@ run_job() {
         fi
     fi
 
+    # Fully resolve the POD5 input now, on the compute node. This is
+    # where any .zip archive actually gets extracted (extract_pod5_zip)
+    # and any nested/zipped directory gets normalized into something
+    # Dorado can read directly (normalize_pod5_directory) -- deliberately
+    # deferred until here so that I/O never runs on the login node while
+    # a user is sitting at the interactive submit_workflow prompts.
+    if ! actual_pod5="$(resolve_pod5_path "$pod5")"; then
+        echo "[ERROR] Could not resolve POD5 input on the compute node: $pod5"
+        exit 1
+    fi
+    echo "[INFO] Resolved POD5 input: $actual_pod5"
+
     # Run the Dorado basecalling script.
     #
     # The dorado_basecall.sh script prints its generated output path
     # to standard output. Command substitution captures that path in
     # the dorado_output variable.
     dorado_output="$("$SRC_DIR/dorado_basecall.sh" \
-        --pod5 "$pod5" \
+        --pod5 "$actual_pod5" \
         --output-dir "$dorado_output_dir" \
         --log-file "$dorado_log" \
         --dorado-model "$dorado_model" \
@@ -979,7 +1088,7 @@ submit_workflow() {
             continue
         fi
 
-        if pod5="$(resolve_pod5_path "$pod5_input")" && pod5_input_has_reads "$pod5"; then
+        if pod5="$(resolve_pod5_input_path "$pod5_input")" && pod5_input_looks_valid "$pod5"; then
             break
         fi
 
